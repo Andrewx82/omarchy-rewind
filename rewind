@@ -1,0 +1,472 @@
+#!/usr/bin/env python3
+"""
+Rewind - Window Grace Period & Undo Restore for Omarchy
+Allows closed applications to be rewound/restored within a configurable countdown or manual memory.
+"""
+
+import sys
+import os
+import json
+import time
+import fcntl
+import subprocess
+from pathlib import Path
+
+STATE_DIR = Path.home() / ".local" / "state" / "omarchy" / "rewind"
+STATE_FILE = STATE_DIR / "state.json"
+LOCK_FILE = STATE_DIR / "state.lock"
+SPECIAL_WORKSPACE = "special:rewind"
+DEFAULT_GRACE_PERIOD = 15.0  # seconds
+
+
+def ensure_state_dir():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+class StateManager:
+    def __init__(self):
+        ensure_state_dir()
+        self.lock_fd = None
+
+    def __enter__(self):
+        self.lock_fd = open(LOCK_FILE, "w+")
+        fcntl.flock(self.lock_fd, fcntl.LOCK_EX)
+        return self._load()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            if self.lock_fd:
+                fcntl.flock(self.lock_fd, fcntl.LOCK_UN)
+                self.lock_fd.close()
+        except Exception:
+            pass
+
+    def _load(self):
+        if STATE_FILE.exists():
+            try:
+                with open(STATE_FILE, "r") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        data.setdefault("enabled", True)
+                        data.setdefault("countdown_enabled", True)
+                        data.setdefault("countdown_seconds", int(DEFAULT_GRACE_PERIOD))
+                        data.setdefault("queue", [])
+                        return data
+            except Exception:
+                pass
+        return {
+            "enabled": True,
+            "countdown_enabled": True,
+            "countdown_seconds": int(DEFAULT_GRACE_PERIOD),
+            "queue": []
+        }
+
+    def save(self, data):
+        tmp = STATE_FILE.with_suffix(".tmp")
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, STATE_FILE)
+
+
+def hypr_dispatch(cmd: str):
+    """Executes a Hyprland dispatcher command."""
+    try:
+        res = subprocess.run(
+            ["hyprctl", "dispatch", cmd],
+            capture_output=True,
+            text=True,
+            timeout=2
+        )
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+def get_active_window():
+    """Returns active window metadata from hyprctl activewindow -j."""
+    try:
+        res = subprocess.run(
+            ["hyprctl", "activewindow", "-j"],
+            capture_output=True,
+            text=True,
+            timeout=2
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            data = json.loads(res.stdout)
+            addr = data.get("address")
+            if addr and addr != "0x0" and data.get("mapped", True):
+                return data
+    except Exception:
+        pass
+    return None
+
+
+def get_all_clients():
+    """Returns all active client windows."""
+    try:
+        res = subprocess.run(
+            ["hyprctl", "clients", "-j"],
+            capture_output=True,
+            text=True,
+            timeout=2
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            return json.loads(res.stdout)
+    except Exception:
+        pass
+    return []
+
+
+def show_osd(icon: str, message: str, duration: int = 1500):
+    """Summons the native Omarchy OSD."""
+    payload = json.dumps({"icon": icon, "message": message, "duration": duration})
+    try:
+        subprocess.run(
+            ["omarchy-shell", "shell", "summon", "omarchy.osd", payload],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2
+        )
+    except Exception:
+        pass
+
+
+def notify_shell_widget():
+    """Notifies Omarchy bar widget to refresh its display."""
+    try:
+        subprocess.run(
+            ["omarchy-shell", "-q", "omarchy.rewind", "refresh"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2
+        )
+    except Exception:
+        pass
+
+
+def action_close():
+    """Handles Super+W close request."""
+    sm = StateManager()
+    spawn_worker = False
+    worker_addr = None
+    worker_now = None
+    worker_duration = None
+
+    with sm as state:
+        enabled = state.get("enabled", True)
+        if not enabled:
+            # Feature is disabled: perform standard immediate close
+            hypr_dispatch("hl.dsp.window.close()")
+            return
+
+        active = get_active_window()
+        if not active:
+            # No active window to close
+            hypr_dispatch("hl.dsp.window.close()")
+            return
+
+        addr = active["address"]
+        ws = active.get("workspace", {})
+        ws_name = str(ws.get("name", ws.get("id", "1")))
+        title = active.get("title", "") or active.get("class", "Window")
+        app_class = active.get("class", "")
+
+        # If window is already on special:rewind, close it permanently
+        if ws_name == SPECIAL_WORKSPACE:
+            hypr_dispatch(f'hl.dsp.window.close({{ window = "address:{addr}" }})')
+            return
+
+        # Move silently to special:rewind
+        move_success = hypr_dispatch(
+            f'hl.dsp.window.move({{ window = "address:{addr}", workspace = "{SPECIAL_WORKSPACE}", follow = false }})'
+        )
+
+        if not move_success:
+            hypr_dispatch(f'hl.dsp.window.close({{ window = "address:{addr}" }})')
+            return
+
+        now = time.time()
+        countdown_enabled = state.get("countdown_enabled", True)
+        countdown_seconds = state.get("countdown_seconds", int(DEFAULT_GRACE_PERIOD))
+        queue = state.get("queue", [])
+
+        if not countdown_enabled:
+            # Manual mode: countdown is disabled.
+            # Replace previous hidden window by permanently closing it
+            for old in queue:
+                old_addr = old.get("address")
+                if old_addr and old_addr != addr:
+                    hypr_dispatch(f'hl.dsp.window.close({{ window = "address:{old_addr}" }})')
+
+            queue = []
+            record = {
+                "address": addr,
+                "workspace": ws_name,
+                "title": title,
+                "class": app_class,
+                "timestamp": now,
+                "expires_at": None
+            }
+            queue.append(record)
+            state["queue"] = queue
+            sm.save(state)
+            show_osd("󰁯", "Rewind: Saved (Super+U to restore)", 1500)
+        else:
+            # Countdown mode
+            queue = [item for item in queue if item["address"] != addr]
+            expires_at = now + countdown_seconds
+            record = {
+                "address": addr,
+                "workspace": ws_name,
+                "title": title,
+                "class": app_class,
+                "timestamp": now,
+                "expires_at": expires_at
+            }
+            queue.append(record)
+            state["queue"] = queue
+            sm.save(state)
+
+            spawn_worker = True
+            worker_addr = addr
+            worker_now = str(now)
+            worker_duration = str(countdown_seconds)
+            show_osd("󰁯", f"Rewind: {countdown_seconds}s grace", 1500)
+
+    if spawn_worker:
+        subprocess.Popen(
+            [sys.executable, __file__, "--expire", worker_addr, worker_now, worker_duration],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+
+    notify_shell_widget()
+
+
+def action_expire(addr: str, timestamp_str: str, duration_str: str):
+    """Background worker that permanently closes the window after the countdown."""
+    try:
+        duration = float(duration_str)
+    except ValueError:
+        duration = DEFAULT_GRACE_PERIOD
+
+    time.sleep(duration)
+    try:
+        ts = float(timestamp_str)
+    except ValueError:
+        return
+
+    sm = StateManager()
+    with sm as state:
+        queue = state.get("queue", [])
+        matching = [item for item in queue if item["address"] == addr and abs(item["timestamp"] - ts) < 0.05]
+        if not matching:
+            # Window was already restored or replaced
+            return
+
+        # Remove from queue
+        state["queue"] = [item for item in queue if not (item["address"] == addr and abs(item["timestamp"] - ts) < 0.05)]
+        sm.save(state)
+
+    # Permanently close window if still in clients
+    clients = get_all_clients()
+    for client in clients:
+        if client.get("address") == addr:
+            hypr_dispatch(f'hl.dsp.window.close({{ window = "address:{addr}" }})')
+            break
+
+    notify_shell_widget()
+
+
+def action_restore():
+    """Restores the most recently closed/hidden window from special:rewind."""
+    sm = StateManager()
+    target = None
+    with sm as state:
+        queue = state.get("queue", [])
+        now = time.time()
+        countdown_enabled = state.get("countdown_enabled", True)
+
+        if countdown_enabled:
+            # Clean up stale items that passed expiration
+            queue = [item for item in queue if item.get("expires_at") and item.get("expires_at", 0) > now]
+
+        if not queue:
+            state["queue"] = []
+            sm.save(state)
+            show_osd("󰁪", "Nothing to rewind", 1200)
+            notify_shell_widget()
+            return
+
+        target = queue.pop()
+        state["queue"] = queue
+        sm.save(state)
+
+    if not target:
+        return
+
+    addr = target["address"]
+    ws = target["workspace"]
+    raw_title = target.get("title", "Window")
+    short_title = (raw_title[:18] + "…") if len(raw_title) > 18 else raw_title
+
+    # Move back to original workspace and focus
+    move_ok = hypr_dispatch(
+        f'hl.dsp.window.move({{ window = "address:{addr}", workspace = "{ws}", follow = true }})'
+    )
+    hypr_dispatch(f'hl.dsp.focus({{ window = "address:{addr}" }})')
+
+    if move_ok:
+        show_osd("󰁪", f"Rewound {short_title}", 1500)
+    else:
+        show_osd("󰁪", "Window no longer running", 1200)
+
+    notify_shell_widget()
+
+
+def action_toggle():
+    """Toggles the Rewind feature ON/OFF with OSD display."""
+    sm = StateManager()
+    with sm as state:
+        current = state.get("enabled", True)
+        new_val = not current
+        state["enabled"] = new_val
+
+        # If turning OFF, permanently close any currently queued windows
+        if not new_val:
+            for item in state.get("queue", []):
+                addr = item["address"]
+                hypr_dispatch(f'hl.dsp.window.close({{ window = "address:{addr}" }})')
+            state["queue"] = []
+
+        sm.save(state)
+
+    if new_val:
+        show_osd("󰁯", "Rewind: ON", 1500)
+    else:
+        show_osd("󰁯", "Rewind: OFF", 1500)
+
+    notify_shell_widget()
+
+
+def action_config(args):
+    """Configures duration and countdown toggle."""
+    sm = StateManager()
+    with sm as state:
+        if "--duration" in args:
+            idx = args.index("--duration")
+            if idx + 1 < len(args):
+                try:
+                    val = max(1, int(args[idx + 1]))
+                    state["countdown_seconds"] = val
+                    state["countdown_enabled"] = True
+                    show_osd("󰁯", f"Rewind Timer: {val}s", 1500)
+                except ValueError:
+                    pass
+        elif "--disable-countdown" in args or "--countdown-off" in args:
+            state["countdown_enabled"] = False
+            show_osd("󰁯", "Rewind: Manual Mode", 1500)
+        elif "--enable-countdown" in args or "--countdown-on" in args:
+            state["countdown_enabled"] = True
+            val = state.get("countdown_seconds", 15)
+            show_osd("󰁯", f"Rewind Timer: {val}s", 1500)
+        elif "--toggle-countdown" in args:
+            curr = state.get("countdown_enabled", True)
+            new_val = not curr
+            state["countdown_enabled"] = new_val
+            if new_val:
+                val = state.get("countdown_seconds", 15)
+                show_osd("󰁯", f"Rewind Timer: {val}s", 1500)
+            else:
+                show_osd("󰁯", "Rewind: Manual Mode", 1500)
+
+        sm.save(state)
+
+    notify_shell_widget()
+
+
+def action_clear():
+    """Permanently closes any queued/hidden windows and clears the queue."""
+    sm = StateManager()
+    with sm as state:
+        for item in state.get("queue", []):
+            addr = item.get("address")
+            if addr:
+                hypr_dispatch(f'hl.dsp.window.close({{ window = "address:{addr}" }})')
+        state["queue"] = []
+        sm.save(state)
+    show_osd("󰅖", "Rewind: Cleared", 1200)
+    notify_shell_widget()
+
+
+def action_menu():
+    """Toggles the Settings Popup on the Omarchy bar."""
+    try:
+        subprocess.run(
+            ["omarchy-shell", "-q", "omarchy.rewind", "toggleMenu"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2
+        )
+    except Exception:
+        pass
+
+
+def action_status():
+    """Outputs status JSON for scripts and widgets."""
+    sm = StateManager()
+    with sm as state:
+        now = time.time()
+        countdown_enabled = state.get("countdown_enabled", True)
+        countdown_seconds = state.get("countdown_seconds", int(DEFAULT_GRACE_PERIOD))
+        queue = state.get("queue", [])
+
+        if countdown_enabled:
+            queue = [item for item in queue if item.get("expires_at") and item.get("expires_at", 0) > now]
+            for item in queue:
+                item["remaining"] = max(0, int(item.get("expires_at", 0) - now))
+        else:
+            for item in queue:
+                item["remaining"] = -1  # Indicates infinite / manual mode
+
+        out = {
+            "enabled": state.get("enabled", True),
+            "countdown_enabled": countdown_enabled,
+            "countdown_seconds": countdown_seconds,
+            "count": len(queue),
+            "queue": queue,
+            "last": queue[-1] if queue else None
+        }
+        print(json.dumps(out))
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: rewind <close|restore|toggle|clear|menu|config ...|status>")
+        sys.exit(1)
+
+    cmd = sys.argv[1]
+    if cmd == "close":
+        action_close()
+    elif cmd == "restore":
+        action_restore()
+    elif cmd == "toggle":
+        action_toggle()
+    elif cmd == "clear":
+        action_clear()
+    elif cmd in ("menu", "settings"):
+        action_menu()
+    elif cmd == "config":
+        action_config(sys.argv[2:])
+    elif cmd in ("status", "--status"):
+        action_status()
+    elif cmd == "--expire" and len(sys.argv) >= 5:
+        action_expire(sys.argv[2], sys.argv[3], sys.argv[4])
+    else:
+        print(f"Unknown command: {cmd}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

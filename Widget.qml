@@ -1,0 +1,360 @@
+import QtQuick
+import Quickshell
+import Quickshell.Io
+import qs.Commons
+import qs.Ui
+
+Panel {
+  id: root
+  moduleName: "omarchy-rewind"
+  ipcTarget: "omarchy.rewind"
+  manageIpc: false
+
+  property bool enabledState: true
+  property bool countdownEnabled: true
+  property int countdownSeconds: 15
+  property bool hasActiveUndo: false
+  property string lastTitle: ""
+  property int remainingSec: 0
+  property int count: 0
+
+  function refresh() {
+    if (!statusProc.running) {
+      statusProc.running = true
+    }
+  }
+
+  function broadcast(method) {
+    var items = bar && typeof bar.moduleWidgets === "function"
+      ? bar.moduleWidgets(moduleName) : [root]
+    for (var i = 0; i < items.length; i++) {
+      if (items[i] && typeof items[i][method] === "function") items[i][method]()
+    }
+  }
+
+  Component.onCompleted: root.refresh()
+
+  IpcHandler {
+    target: "omarchy.rewind"
+
+    function refresh(): void {
+      root.broadcast("refresh")
+    }
+
+    function toggle(): void {
+      root.toggle()
+    }
+
+    function toggleMenu(): void {
+      root.toggle()
+    }
+
+    function open(): void {
+      root.open()
+    }
+
+    function close(): void {
+      root.close()
+    }
+  }
+
+  Process {
+    id: statusProc
+    command: ["rewind", "--status"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var data = JSON.parse(text)
+          root.enabledState = data.enabled !== false
+          root.countdownEnabled = data.countdown_enabled !== false
+          root.countdownSeconds = data.countdown_seconds || 15
+          root.count = data.count || 0
+          root.hasActiveUndo = root.count > 0
+          if (data.last) {
+            root.lastTitle = data.last.title || data.last.class || "App"
+            root.remainingSec = data.last.remaining !== undefined ? data.last.remaining : 15
+          } else {
+            root.lastTitle = ""
+            root.remainingSec = 0
+          }
+        } catch (e) {}
+      }
+    }
+  }
+
+  // 1-second countdown tick for active undo in timer mode
+  Timer {
+    id: countdownTimer
+    interval: 1000
+    repeat: true
+    running: root.hasActiveUndo && root.countdownEnabled && root.remainingSec > 0
+    onTriggered: {
+      if (root.remainingSec > 1) {
+        root.remainingSec -= 1
+      } else {
+        root.refresh()
+      }
+    }
+  }
+
+  // Passive fallback check; real-time updates are driven via IPC
+  Timer {
+    interval: 30000
+    repeat: true
+    running: true
+    onTriggered: root.refresh()
+  }
+
+  visible: root.hasActiveUndo || !root.setting("hideWhenIdle", false)
+  implicitWidth: button.implicitWidth
+  implicitHeight: button.implicitHeight
+
+  BarIconButton {
+    id: button
+    anchors.fill: parent
+    bar: root.bar
+    fontSize: Style.bar.iconFont
+    slotSize: root.hasActiveUndo && !vertical ? Style.bar.iconSlot * 2.5 : Style.bar.iconSlot
+    active: root.hasActiveUndo || root.opened
+    dimmed: !root.hasActiveUndo && !root.opened
+    opacity: !root.enabledState ? 0.45 : 1.0
+
+    text: {
+      if (root.hasActiveUndo) {
+        if (root.countdownEnabled && root.remainingSec >= 0) {
+          return "󰁯 " + root.remainingSec + "s"
+        } else {
+          return "󰁯 Saved"
+        }
+      }
+      return "󰁯"
+    }
+
+    tooltipText: {
+      if (root.hasActiveUndo) {
+        if (root.countdownEnabled && root.remainingSec >= 0) {
+          return "Rewind (" + root.remainingSec + "s remaining: " + root.lastTitle + ")\nClick for menu or Super+U to restore"
+        } else {
+          return "Rewind (Saved in memory: " + root.lastTitle + ")\nClick for menu or Super+U to restore"
+        }
+      }
+      if (root.enabledState) {
+        return "Rewind: ON" + (root.countdownEnabled ? " (" + root.countdownSeconds + "s timer)" : " (Manual mode)") + "\nClick for settings"
+      }
+      return "Rewind: OFF\nClick for settings"
+    }
+
+    onPressed: function(b) {
+      root.toggle()
+    }
+  }
+
+  KeyboardPanel {
+    id: panel
+    anchorItem: button
+    owner: root
+    bar: root.bar
+    open: root.opened
+    contentWidth: panel.fittedContentWidth(Style.space(350))
+    contentHeight: Math.max(Style.space(260), panel.fittedContentHeight(settingsColumn.childrenRect.height))
+
+    Column {
+      id: settingsColumn
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.top: parent.top
+      spacing: Style.space(12)
+
+      // Header
+      Item {
+        width: parent.width
+        height: Style.space(28)
+
+        Row {
+          anchors.fill: parent
+          spacing: Style.space(10)
+
+          Text {
+            text: "󰁯"
+            color: root.barForeground
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.title
+            anchors.verticalCenter: parent.verticalCenter
+          }
+
+          Text {
+            text: "Rewind Settings"
+            color: root.barForeground
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.subtitle
+            font.bold: true
+            anchors.verticalCenter: parent.verticalCenter
+          }
+        }
+      }
+
+      // Feature Toggle
+      Toggle {
+        width: parent.width
+        label: "Enable Rewind"
+        description: "Intercept Super+W with undo grace"
+        checked: root.enabledState
+        onClicked: {
+          if (root.bar) root.bar.run("rewind toggle")
+        }
+      }
+
+      // Countdown Timer Toggle
+      Toggle {
+        width: parent.width
+        label: "Countdown Timer"
+        description: root.countdownEnabled ? "Auto-close after countdown" : "Saved in memory until restored/replaced"
+        checked: root.countdownEnabled
+        onClicked: {
+          if (root.bar) root.bar.run("rewind config --toggle-countdown")
+        }
+      }
+
+      // Duration selector (when countdown timer is enabled)
+      Item {
+        width: parent.width
+        height: Style.space(66)
+        visible: root.countdownEnabled
+
+        Column {
+          anchors.fill: parent
+          spacing: Style.space(8)
+
+          Row {
+            spacing: Style.space(6)
+
+            Text {
+              text: "Countdown Duration:"
+              color: root.barForeground
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: Style.font.caption
+              opacity: 0.8
+            }
+
+            Text {
+              text: root.countdownSeconds + " seconds"
+              color: Color.accent
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: Style.font.caption
+              font.bold: true
+            }
+          }
+
+          Row {
+            spacing: Style.space(6)
+            width: parent.width
+
+            Repeater {
+              model: [5, 10, 15, 30, 60]
+              delegate: Button {
+                width: Style.space(54)
+                height: Style.space(32)
+                text: modelData + "s"
+                bordered: true
+                selected: root.countdownSeconds === modelData
+                onClicked: {
+                  if (root.bar) root.bar.run("rewind config --duration " + modelData)
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // Manual Mode info banner (when countdown is disabled)
+      BorderSurface {
+        width: parent.width
+        height: Style.space(68)
+        visible: !root.countdownEnabled
+        radius: Style.cornerRadius
+        color: Style.normalFillFor(root.barForeground, Color.accent)
+        borderSpec: Border.controlSpec("normal", root.barForeground, Color.accent)
+
+        Row {
+          anchors.fill: parent
+          anchors.margins: Style.space(8)
+          spacing: Style.space(8)
+
+          Text {
+            text: "󰋽"
+            color: Color.accent
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.title
+            anchors.verticalCenter: parent.verticalCenter
+          }
+
+          Text {
+            width: parent.width - Style.space(36)
+            text: "Manual Mode: Closed window stays saved in memory until you press Super+U or close another window (which closes the previous and replaces it)."
+            color: root.barForeground
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+            anchors.verticalCenter: parent.verticalCenter
+          }
+        }
+      }
+
+      // If there is currently an app in hidden memory / undo queue
+      Item {
+        width: parent.width
+        height: Style.space(76)
+        visible: root.hasActiveUndo
+
+        Column {
+          anchors.fill: parent
+          spacing: Style.space(8)
+
+          PanelSeparator { width: parent.width }
+
+          Text {
+            text: "Currently Saved: " + root.lastTitle + (root.countdownEnabled && root.remainingSec > 0 ? " (" + root.remainingSec + "s)" : "")
+            textFormat: Text.PlainText
+            color: Color.accent
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.caption
+            font.bold: true
+            elide: Text.ElideRight
+            width: parent.width
+          }
+
+          Row {
+            spacing: Style.space(8)
+            width: parent.width
+
+            Button {
+              width: Style.space(140)
+              height: Style.space(34)
+              text: "Rewind Window"
+              iconText: "󰁪"
+              bordered: true
+              accent: Color.accent
+              onClicked: {
+                root.close()
+                if (root.bar) root.bar.run("rewind restore")
+              }
+            }
+
+            Button {
+              width: Style.space(140)
+              height: Style.space(34)
+              text: "Close Permanently"
+              iconText: "󰅖"
+              bordered: true
+              onClicked: {
+                root.close()
+                if (root.bar) root.bar.run("rewind clear")
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

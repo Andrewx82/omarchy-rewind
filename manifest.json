@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "omarchy-rewind",
+  "name": "Rewind",
+  "version": "1.0.0",
+  "author": "Andrew",
+  "description": "Instant undo and grace period for closed applications",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Widget.qml"
+  },
+  "barWidget": {
+    "displayName": "Rewind",
+    "description": "Control window undo grace period, countdown, and hidden memory",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
