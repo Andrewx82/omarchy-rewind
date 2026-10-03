@@ -18,6 +18,13 @@ Panel {
   property int remainingSec: 0
   property int count: 0
 
+  readonly property string rewindBin: decodeURIComponent(Qt.resolvedUrl("rewind").toString().replace(/^file:\/\//, ""))
+
+  Process {
+    id: ensureBinProc
+    command: ["/bin/sh", "-c", "mkdir -p \"$HOME/.local/bin\" && ln -sf \"" + root.rewindBin + "\" \"$HOME/.local/bin/rewind\" && ln -sf \"" + root.rewindBin + "\" \"$HOME/.local/bin/omarchy-rewind\""]
+  }
+
   function refresh() {
     if (!statusProc.running) {
       statusProc.running = true
@@ -32,7 +39,10 @@ Panel {
     }
   }
 
-  Component.onCompleted: root.refresh()
+  Component.onCompleted: {
+    ensureBinProc.running = true
+    root.refresh()
+  }
 
   IpcHandler {
     target: "omarchy.rewind"
@@ -60,7 +70,7 @@ Panel {
 
   Process {
     id: statusProc
-    command: ["rewind", "--status"]
+    command: [root.rewindBin, "--status"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -201,7 +211,7 @@ Panel {
         description: "Intercept Super+W with undo grace"
         checked: root.enabledState
         onClicked: {
-          if (root.bar) root.bar.run("rewind toggle")
+          if (root.bar) root.bar.run(root.rewindBin + " toggle")
         }
       }
 
@@ -212,7 +222,7 @@ Panel {
         description: root.countdownEnabled ? "Auto-close after countdown" : "Saved in memory until restored/replaced"
         checked: root.countdownEnabled
         onClicked: {
-          if (root.bar) root.bar.run("rewind config --toggle-countdown")
+          if (root.bar) root.bar.run(root.rewindBin + " config --toggle-countdown")
         }
       }
 
@@ -259,7 +269,7 @@ Panel {
                 bordered: true
                 selected: root.countdownSeconds === modelData
                 onClicked: {
-                  if (root.bar) root.bar.run("rewind config --duration " + modelData)
+                  if (root.bar) root.bar.run(root.rewindBin + " config --duration " + modelData)
                 }
               }
             }
@@ -337,7 +347,7 @@ Panel {
               accent: Color.accent
               onClicked: {
                 root.close()
-                if (root.bar) root.bar.run("rewind restore")
+                if (root.bar) root.bar.run(root.rewindBin + " restore")
               }
             }
 
@@ -349,7 +359,7 @@ Panel {
               bordered: true
               onClicked: {
                 root.close()
-                if (root.bar) root.bar.run("rewind clear")
+                if (root.bar) root.bar.run(root.rewindBin + " clear")
               }
             }
           }

@@ -31,30 +31,13 @@ Accidentally closed your browser, terminal with running tasks, or editor? Rewind
 
 ## Installation
 
-### One-Command Quick Install (Recommended)
-
-Run this single command in your terminal to install the plugin, enable it in your status bar, and configure the executable:
+Install and enable Rewind with a single command:
 
 ```bash
-omarchy plugin add https://github.com/Andrewx82/omarchy-rewind.git --enable && ~/.config/omarchy/plugins/omarchy-rewind/setup.sh
+omarchy plugin add https://github.com/Andrewx82/omarchy-rewind.git --enable
 ```
 
-### Manual Installation
-
-1. Clone the repository into your Omarchy plugins directory:
-   ```bash
-   git clone https://github.com/Andrewx82/omarchy-rewind.git ~/.config/omarchy/plugins/omarchy-rewind
-   ```
-
-2. Run the setup script to link the `rewind` executable:
-   ```bash
-   ~/.config/omarchy/plugins/omarchy-rewind/setup.sh
-   ```
-
-3. Enable the plugin in your status bar:
-   ```bash
-   omarchy plugin enable omarchy-rewind --section right
-   ```
+> **Note**: When enabled, the status bar widget automatically provisions the `rewind` executable in `~/.local/bin/` so you can use the CLI and keybindings immediately.
 
 ---
 
