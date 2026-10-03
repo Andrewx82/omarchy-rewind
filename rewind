@@ -436,6 +436,48 @@ def action_menu():
         pass
 
 
+BINDINGS_LUA = Path.home() / ".config" / "hypr" / "bindings.lua"
+
+REWIND_BINDINGS_BLOCK = """
+-- Rewind Plugin: Instant undo and grace period for closed windows
+hl.unbind("SUPER + W")
+o.bind("SUPER + W", "Close window (Rewind grace)", "rewind close")
+o.bind("SUPER + U", "Rewind closed window", "rewind restore")
+o.bind("SUPER + CTRL + U", "Toggle Rewind", "rewind toggle")
+o.bind("SUPER + ALT + W", "Toggle Rewind", "rewind toggle")
+o.bind("SUPER + SHIFT + U", "Rewind settings menu", "rewind menu")
+"""
+
+
+def are_bindings_installed() -> bool:
+    if not BINDINGS_LUA.exists():
+        return False
+    try:
+        content = BINDINGS_LUA.read_text(encoding="utf-8")
+        return "rewind close" in content
+    except Exception:
+        return False
+
+
+def action_setup():
+    """Configures Hyprland keybindings in ~/.config/hypr/bindings.lua."""
+    BINDINGS_LUA.parent.mkdir(parents=True, exist_ok=True)
+    if not BINDINGS_LUA.exists():
+        BINDINGS_LUA.write_text("-- Personal keybinding overrides\n", encoding="utf-8")
+
+    content = BINDINGS_LUA.read_text(encoding="utf-8")
+    if "rewind close" in content:
+        print("Keybindings are already configured in ~/.config/hypr/bindings.lua")
+    else:
+        with open(BINDINGS_LUA, "a", encoding="utf-8") as f:
+            f.write(REWIND_BINDINGS_BLOCK)
+        print("Added Rewind keybindings to ~/.config/hypr/bindings.lua")
+
+    subprocess.run(["hyprctl", "reload"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    show_osd("󰁯", "Rewind: Shortcuts Enabled!", 1500)
+    notify_shell_widget()
+
+
 def action_status():
     """Outputs status JSON for scripts and widgets."""
     sm = StateManager()
@@ -457,6 +499,7 @@ def action_status():
             "enabled": state.get("enabled", True),
             "countdown_enabled": countdown_enabled,
             "countdown_seconds": countdown_seconds,
+            "bindings_installed": are_bindings_installed(),
             "count": len(queue),
             "queue": queue,
             "last": queue[-1] if queue else None
@@ -482,6 +525,8 @@ def main():
         action_menu()
     elif cmd == "config":
         action_config(sys.argv[2:])
+    elif cmd in ("setup", "install-bindings"):
+        action_setup()
     elif cmd in ("status", "--status"):
         action_status()
     elif cmd == "--expire" and len(sys.argv) >= 5:

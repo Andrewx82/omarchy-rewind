@@ -17,6 +17,7 @@ Panel {
   property string lastTitle: ""
   property int remainingSec: 0
   property int count: 0
+  property bool bindingsInstalled: true
 
   readonly property string rewindBin: decodeURIComponent(Qt.resolvedUrl("rewind").toString().replace(/^file:\/\//, ""))
 
@@ -81,6 +82,7 @@ Panel {
           root.countdownSeconds = data.countdown_seconds || 15
           root.count = data.count || 0
           root.hasActiveUndo = root.count > 0
+          root.bindingsInstalled = data.bindings_installed !== false
           if (data.last) {
             root.lastTitle = data.last.title || data.last.class || "App"
             root.remainingSec = data.last.remaining !== undefined ? data.last.remaining : 15
@@ -200,6 +202,63 @@ Panel {
             font.pixelSize: Style.font.subtitle
             font.bold: true
             anchors.verticalCenter: parent.verticalCenter
+          }
+        }
+      }
+
+      // Shortcuts setup banner (shown if Hyprland bindings not yet added)
+      BorderSurface {
+        width: parent.width
+        height: Style.space(72)
+        visible: !root.bindingsInstalled
+        radius: Style.cornerRadius
+        color: Style.normalFillFor(root.barForeground, Color.warning)
+        borderSpec: Border.controlSpec("normal", root.barForeground, Color.warning)
+
+        Row {
+          anchors.fill: parent
+          anchors.margins: Style.space(8)
+          spacing: Style.space(8)
+
+          Text {
+            text: "󰀦"
+            color: Color.warning
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.title
+            anchors.verticalCenter: parent.verticalCenter
+          }
+
+          Column {
+            width: parent.width - Style.space(110)
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(2)
+
+            Text {
+              text: "Shortcuts Not Enabled"
+              textFormat: Text.PlainText
+              color: root.barForeground
+              font.bold: true
+              font.pixelSize: Style.font.caption
+            }
+            Text {
+              text: "Enable Super+W & Super+U"
+              textFormat: Text.PlainText
+              color: root.barForeground
+              opacity: 0.8
+              font.pixelSize: Style.font.caption
+            }
+          }
+
+          Button {
+            width: Style.space(74)
+            height: Style.space(32)
+            text: "Enable"
+            bordered: true
+            accent: Color.warning
+            anchors.verticalCenter: parent.verticalCenter
+            onClicked: {
+              if (root.bar) root.bar.run(root.rewindBin + " setup")
+            }
           }
         }
       }

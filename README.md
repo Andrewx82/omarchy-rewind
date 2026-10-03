@@ -31,13 +31,18 @@ Accidentally closed your browser, terminal with running tasks, or editor? Rewind
 
 ## Installation
 
-Install and enable Rewind with a single command:
+### 1. Install and enable the plugin:
 
 ```bash
 omarchy plugin add https://github.com/Andrewx82/omarchy-rewind.git --enable
 ```
 
-> **Note**: When enabled, the status bar widget automatically provisions the `rewind` executable in `~/.local/bin/` so you can use the CLI and keybindings immediately.
+### 2. Enable Hyprland shortcuts (`Super + W`, `Super + U`):
+
+Choose either method:
+- **1-Click via Bar Widget**: Click the Rewind icon on your status bar and click **Enable** on the shortcuts banner.
+- **1-Command via Terminal**: Run `rewind setup`.
+- **Manual Config**: Add the keybinding snippet below to `~/.config/hypr/bindings.lua`.
 
 ---
 
@@ -84,6 +89,7 @@ The `rewind` utility can be controlled directly from the terminal or your own sc
 | `rewind config --disable-countdown` | Switch to manual indefinite memory mode |
 | `rewind config --enable-countdown` | Switch to countdown timer mode |
 | `rewind config --toggle-countdown` | Toggle between timer and manual modes |
+| `rewind setup` | Configure Hyprland shortcuts in ~/.config/hypr/bindings.lua |
 | `rewind status` | Output JSON state for status bars and scripts |
 
 ---
