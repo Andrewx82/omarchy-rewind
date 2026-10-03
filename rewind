@@ -6,9 +6,11 @@ Allows closed applications to be rewound/restored within a configurable countdow
 
 import sys
 import os
+import re
 import json
 import time
 import fcntl
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -439,13 +441,14 @@ def action_menu():
 BINDINGS_LUA = Path.home() / ".config" / "hypr" / "bindings.lua"
 
 REWIND_BINDINGS_BLOCK = """
--- Rewind Plugin: Instant undo and grace period for closed windows
+-- START: Rewind Plugin Keybindings
 hl.unbind("SUPER + W")
 o.bind("SUPER + W", "Close window (Rewind grace)", "rewind close")
 o.bind("SUPER + U", "Rewind closed window", "rewind restore")
 o.bind("SUPER + CTRL + U", "Toggle Rewind", "rewind toggle")
 o.bind("SUPER + ALT + W", "Toggle Rewind", "rewind toggle")
 o.bind("SUPER + SHIFT + U", "Rewind settings menu", "rewind menu")
+-- END: Rewind Plugin Keybindings
 """
 
 
@@ -490,6 +493,106 @@ def action_setup():
     notify_shell_widget()
 
 
+def action_remove_bindings(quiet=False):
+    """Removes Rewind keybindings from ~/.config/hypr/bindings.lua and reloads Hyprland to restore defaults."""
+    if BINDINGS_LUA.exists():
+        try:
+            content = BINDINGS_LUA.read_text(encoding="utf-8")
+
+            # 1. Remove delimited block if present
+            delimited_pattern = r"\n?-- START: Rewind Plugin Keybindings.*?-- END: Rewind Plugin Keybindings\n?"
+            cleaned = re.sub(delimited_pattern, "", content, flags=re.DOTALL)
+
+            # 2. Remove legacy block if present
+            legacy_pattern = r"\n?-- Rewind Plugin:.*?rewind menu\"\)\n?"
+            cleaned = re.sub(legacy_pattern, "", cleaned, flags=re.DOTALL)
+
+            # 3. Remove any unbind("SUPER + W") directly preceding a rewind close binding
+            cleaned = re.sub(
+                r'hl\.unbind\s*\(\s*["\']SUPER \+ W["\']\s*\)\s*\n\s*o\.bind\s*\(\s*["\']SUPER \+ W["\']\s*,\s*[^,]+,\s*["\']rewind close["\']\s*\)\n?',
+                '',
+                cleaned
+            )
+
+            # 4. Final filter for any stray rewind lines
+            lines = cleaned.splitlines()
+            filtered = [
+                line for line in lines
+                if "rewind close" not in line
+                and "rewind restore" not in line
+                and "rewind toggle" not in line
+                and "rewind menu" not in line
+                and not line.strip().startswith("-- START: Rewind")
+                and not line.strip().startswith("-- END: Rewind")
+                and not line.strip().startswith("-- Rewind Plugin:")
+            ]
+
+            final_content = "\n".join(filtered).strip() + "\n"
+            BINDINGS_LUA.write_text(final_content, encoding="utf-8")
+            if not quiet:
+                print("Removed Rewind keybindings from ~/.config/hypr/bindings.lua")
+        except Exception as e:
+            if not quiet:
+                print(f"Error removing Rewind bindings: {e}")
+
+    subprocess.run(["hyprctl", "reload"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if not quiet:
+        show_osd("󰁯", "Rewind: Default Shortcuts Restored", 1500)
+        notify_shell_widget()
+
+
+def action_uninstall():
+    """Completely uninstalls Rewind: restores default shortcuts, removes symlinks, state, and plugin."""
+    print("Uninstalling Rewind...")
+
+    # 1. Restore keybindings and reload Hyprland
+    action_remove_bindings(quiet=False)
+
+    # 2. Remove ~/.local/bin symlinks
+    bin_dir = Path.home() / ".local" / "bin"
+    for link_name in ("rewind", "omarchy-rewind"):
+        link_path = bin_dir / link_name
+        try:
+            if link_path.is_symlink() or link_path.exists():
+                link_path.unlink()
+                print(f"Removed symlink: {link_path}")
+        except Exception as e:
+            print(f"Notice: Could not remove {link_path}: {e}")
+
+    # 3. Clean up state directory
+    if STATE_DIR.exists():
+        try:
+            shutil.rmtree(STATE_DIR, ignore_errors=True)
+            print(f"Cleaned up state directory: {STATE_DIR}")
+        except Exception as e:
+            print(f"Notice: Could not remove {STATE_DIR}: {e}")
+
+    # 4. Remove plugin from Omarchy shell
+    plugin_dir = Path.home() / ".config" / "omarchy" / "plugins" / "omarchy-rewind"
+    try:
+        res = subprocess.run(
+            ["omarchy", "plugin", "remove", "omarchy-rewind", "--yes"],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if res.returncode == 0:
+            print("Removed omarchy-rewind from Omarchy plugins.")
+        else:
+            if plugin_dir.exists():
+                shutil.rmtree(plugin_dir, ignore_errors=True)
+                subprocess.run(["omarchy-shell", "shell", "rescanPlugins"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                print(f"Removed {plugin_dir}")
+    except Exception:
+        if plugin_dir.exists():
+            shutil.rmtree(plugin_dir, ignore_errors=True)
+            subprocess.run(["omarchy-shell", "shell", "rescanPlugins"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print(f"Removed {plugin_dir}")
+
+    print("\nRewind has been successfully uninstalled.")
+    print("Default Super+W window closing behavior has been restored.")
+
+
 def action_status():
     """Outputs status JSON for scripts and widgets."""
     sm = StateManager()
@@ -521,7 +624,7 @@ def action_status():
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: rewind <close|restore|toggle|clear|menu|config ...|status>")
+        print("Usage: rewind <close|restore|toggle|clear|menu|setup|remove-bindings|uninstall|config ...|status>")
         sys.exit(1)
 
     cmd = sys.argv[1]
@@ -539,12 +642,30 @@ def main():
         action_config(sys.argv[2:])
     elif cmd in ("setup", "install-bindings"):
         action_setup()
+    elif cmd in ("remove-bindings", "uninstall-bindings", "restore-defaults"):
+        action_remove_bindings()
+    elif cmd == "uninstall":
+        action_uninstall()
     elif cmd in ("status", "--status"):
         action_status()
     elif cmd == "--expire" and len(sys.argv) >= 5:
         action_expire(sys.argv[2], sys.argv[3], sys.argv[4])
+    elif cmd in ("-h", "--help", "help"):
+        print("Rewind - Window Grace Period & Undo Restore for Omarchy\n")
+        print("Commands:")
+        print("  close               Soft-close active window with Rewind grace period")
+        print("  restore             Restore / rewind last closed window")
+        print("  toggle              Toggle Rewind ON / OFF")
+        print("  menu                Open settings popup on the status bar")
+        print("  clear               Permanently terminate hidden windows")
+        print("  setup               Configure shortcuts in ~/.config/hypr/bindings.lua")
+        print("  remove-bindings     Remove shortcuts and restore Omarchy defaults")
+        print("  uninstall           Completely uninstall Rewind and restore defaults")
+        print("  config ...          Configure grace period countdown")
+        print("  status              Output state JSON")
     else:
         print(f"Unknown command: {cmd}")
+        print("Run 'rewind --help' for usage.")
         sys.exit(1)
 
 

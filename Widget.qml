@@ -263,6 +263,62 @@ Panel {
         }
       }
 
+      // Shortcuts active banner (shown if Hyprland bindings are active)
+      BorderSurface {
+        width: parent.width
+        height: Style.space(56)
+        visible: root.bindingsInstalled
+        radius: Style.cornerRadius
+        color: Style.controlFill("normal", root.barForeground)
+        borderSpec: Border.controlSpec("normal", root.barForeground)
+
+        Row {
+          anchors.fill: parent
+          anchors.margins: Style.space(8)
+          spacing: Style.space(8)
+
+          Text {
+            text: "󰌌"
+            color: Color.accent
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.title
+            anchors.verticalCenter: parent.verticalCenter
+          }
+
+          Column {
+            width: parent.width - Style.space(146)
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(1)
+
+            Text {
+              text: "Shortcuts Active"
+              textFormat: Text.PlainText
+              color: root.barForeground
+              font.bold: true
+              font.pixelSize: Style.font.caption
+            }
+            Text {
+              text: "Super+W & Super+U"
+              textFormat: Text.PlainText
+              color: root.barForeground
+              opacity: 0.75
+              font.pixelSize: Style.font.caption
+            }
+          }
+
+          Button {
+            width: Style.space(110)
+            height: Style.space(32)
+            text: "Restore Defaults"
+            bordered: true
+            anchors.verticalCenter: parent.verticalCenter
+            onClicked: {
+              if (root.bar) root.bar.run(root.rewindBin + " remove-bindings")
+            }
+          }
+        }
+      }
+
       // Feature Toggle
       Toggle {
         width: parent.width

@@ -90,6 +90,8 @@ The `rewind` utility can be controlled directly from the terminal or your own sc
 | `rewind config --enable-countdown` | Switch to countdown timer mode |
 | `rewind config --toggle-countdown` | Toggle between timer and manual modes |
 | `rewind setup` | Configure Hyprland shortcuts in ~/.config/hypr/bindings.lua |
+| `rewind remove-bindings` | Remove shortcuts from bindings.lua and restore Omarchy defaults |
+| `rewind uninstall` | Completely uninstall Rewind and restore Omarchy defaults |
 | `rewind status` | Output JSON state for status bars and scripts |
 
 ---
@@ -104,14 +106,23 @@ To update Rewind to the latest version:
 omarchy plugin update omarchy-rewind --yes
 ```
 
-### Uninstall
+### Clean Uninstall
 
-To uninstall Rewind and remove it from your status bar:
+To completely uninstall Rewind, automatically restore your default Omarchy shortcuts (`Super + W` -> standard close), and clean up all symlinks and state:
 
 ```bash
-omarchy plugin remove omarchy-rewind --yes
-rm -f ~/.local/bin/rewind ~/.local/bin/omarchy-rewind
+rewind uninstall
 ```
+
+### Restore Default Shortcuts Only
+
+If you want to keep the Rewind plugin installed but switch back to default Omarchy shortcuts:
+- **Via Status Bar**: Click the Rewind icon on your status bar and click **Restore Defaults**.
+- **Via Terminal**: Run:
+  ```bash
+  rewind remove-bindings
+  ```
+To re-enable Rewind shortcuts at any time, run `rewind setup` or click **Enable** in the status bar menu.
 
 ---
 
