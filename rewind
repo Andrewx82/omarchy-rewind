@@ -460,7 +460,19 @@ def are_bindings_installed() -> bool:
 
 
 def action_setup():
-    """Configures Hyprland keybindings in ~/.config/hypr/bindings.lua."""
+    """Configures Hyprland keybindings in ~/.config/hypr/bindings.lua and ensures ~/.local/bin symlinks exist."""
+    bin_dir = Path.home() / ".local" / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    target_bin = Path(__file__).resolve()
+    for link_name in ("rewind", "omarchy-rewind"):
+        link_path = bin_dir / link_name
+        try:
+            if link_path.is_symlink() or link_path.exists():
+                link_path.unlink()
+            link_path.symlink_to(target_bin)
+        except Exception:
+            pass
+
     BINDINGS_LUA.parent.mkdir(parents=True, exist_ok=True)
     if not BINDINGS_LUA.exists():
         BINDINGS_LUA.write_text("-- Personal keybinding overrides\n", encoding="utf-8")
