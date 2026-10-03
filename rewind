@@ -259,10 +259,20 @@ def action_expire(addr: str, timestamp_str: str, duration_str: str):
 
     sm = StateManager()
     with sm as state:
+        if not state.get("countdown_enabled", True):
+            # Mode changed to manual during grace period; do not expire
+            return
+
         queue = state.get("queue", [])
         matching = [item for item in queue if item["address"] == addr and abs(item["timestamp"] - ts) < 0.05]
         if not matching:
             # Window was already restored or replaced
+            return
+
+        target = matching[0]
+        expires_at = target.get("expires_at")
+        if expires_at is None or time.time() < (expires_at - 0.2):
+            # Expiration was cancelled or deadline was extended
             return
 
         # Remove from queue
@@ -361,15 +371,23 @@ def action_config(args):
                     val = max(1, int(args[idx + 1]))
                     state["countdown_seconds"] = val
                     state["countdown_enabled"] = True
+                    now = time.time()
+                    for item in state.get("queue", []):
+                        item["expires_at"] = now + val
                     show_osd("󰁯", f"Rewind Timer: {val}s", 1500)
                 except ValueError:
                     pass
         elif "--disable-countdown" in args or "--countdown-off" in args:
             state["countdown_enabled"] = False
+            for item in state.get("queue", []):
+                item["expires_at"] = None
             show_osd("󰁯", "Rewind: Manual Mode", 1500)
         elif "--enable-countdown" in args or "--countdown-on" in args:
             state["countdown_enabled"] = True
             val = state.get("countdown_seconds", 15)
+            now = time.time()
+            for item in state.get("queue", []):
+                item["expires_at"] = now + val
             show_osd("󰁯", f"Rewind Timer: {val}s", 1500)
         elif "--toggle-countdown" in args:
             curr = state.get("countdown_enabled", True)
@@ -377,8 +395,13 @@ def action_config(args):
             state["countdown_enabled"] = new_val
             if new_val:
                 val = state.get("countdown_seconds", 15)
+                now = time.time()
+                for item in state.get("queue", []):
+                    item["expires_at"] = now + val
                 show_osd("󰁯", f"Rewind Timer: {val}s", 1500)
             else:
+                for item in state.get("queue", []):
+                    item["expires_at"] = None
                 show_osd("󰁯", "Rewind: Manual Mode", 1500)
 
         sm.save(state)
