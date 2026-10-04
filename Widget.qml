@@ -18,6 +18,7 @@ Panel {
   property int remainingSec: 0
   property int count: 0
   property bool bindingsInstalled: true
+  property bool pauseMedia: true
 
   readonly property string rewindBin: decodeURIComponent(Qt.resolvedUrl("rewind").toString().replace(/^file:\/\//, ""))
 
@@ -83,6 +84,7 @@ Panel {
           root.count = data.count || 0
           root.hasActiveUndo = root.count > 0
           root.bindingsInstalled = data.bindings_installed !== false
+          root.pauseMedia = data.pause_media !== false
           if (data.last) {
             root.lastTitle = data.last.title || data.last.class || "App"
             root.remainingSec = data.last.remaining !== undefined ? data.last.remaining : 15
@@ -423,6 +425,17 @@ Panel {
             wrapMode: Text.WordWrap
             anchors.verticalCenter: parent.verticalCenter
           }
+        }
+      }
+
+      // Auto-Pause Media Toggle
+      Toggle {
+        width: parent.width
+        label: "Auto-Pause Media"
+        description: "Pause video/audio on close & resume on rewind"
+        checked: root.pauseMedia
+        onClicked: {
+          if (root.bar) root.bar.run(root.rewindBin + " config --toggle-media")
         }
       }
 

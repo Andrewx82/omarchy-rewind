@@ -24,6 +24,7 @@ Accidentally closed your browser, terminal with running tasks, or editor? Rewind
   - **Countdown Timer Mode (Default)**: Automatically terminates the application after a customizable countdown (default: 15s).
   - **Manual Indefinite Mode**: Disables the timer. The closed application remains safely in hidden memory until you restore it (`Super + U`) or close another window (which terminates the previous one and takes its place).
 - **Interactive Bar Widget & Settings Menu**: Click the status bar icon or press `Super + Shift + U` to open the settings popup. Adjust grace periods (5s, 10s, 15s, 30s, 60s), switch modes, or view remaining time.
+- **Smart Media Auto-Pause & Resume**: Automatically detects if audio or video is playing in the window via MPRIS D-Bus (YouTube, Spotify, browser video tabs, media players). Silently pauses playback when hidden into grace memory, and seamlessly resumes when restored.
 - **Native Omarchy OSD**: Displays native on-screen notifications when closing, rewinding, or toggling modes.
 - **Zero Background Resource Overhead**: Ultra lightweight Python 3 architecture using only standard library modules and file locking. No persistent background daemons when idle (<0.1% CPU).
 
@@ -89,6 +90,7 @@ The `rewind` utility can be controlled directly from the terminal or your own sc
 | `rewind config --disable-countdown` | Switch to manual indefinite memory mode |
 | `rewind config --enable-countdown` | Switch to countdown timer mode |
 | `rewind config --toggle-countdown` | Toggle between timer and manual modes |
+| `rewind config --toggle-media` | Toggle auto-pausing playing media ON / OFF |
 | `rewind setup` | Configure Hyprland shortcuts in ~/.config/hypr/bindings.lua |
 | `rewind remove-bindings` | Remove shortcuts from bindings.lua and restore Omarchy defaults |
 | `rewind uninstall` | Completely uninstall Rewind and restore Omarchy defaults |

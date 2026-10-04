@@ -52,6 +52,7 @@ class StateManager:
                         data.setdefault("enabled", True)
                         data.setdefault("countdown_enabled", True)
                         data.setdefault("countdown_seconds", int(DEFAULT_GRACE_PERIOD))
+                        data.setdefault("pause_media", True)
                         data.setdefault("queue", [])
                         return data
             except Exception:
@@ -60,6 +61,7 @@ class StateManager:
             "enabled": True,
             "countdown_enabled": True,
             "countdown_seconds": int(DEFAULT_GRACE_PERIOD),
+            "pause_media": True,
             "queue": []
         }
 
@@ -146,6 +148,154 @@ def notify_shell_widget():
         pass
 
 
+def get_process_ancestors(pid: int) -> set:
+    """Returns the set of ancestor PIDs for a given PID."""
+    ancestors = set()
+    curr = pid
+    while curr > 1:
+        ancestors.add(curr)
+        try:
+            with open(f"/proc/{curr}/stat", "r") as f:
+                content = f.read()
+                ppid = int(content.split(")")[-1].split()[1])
+                if ppid == curr or ppid <= 0:
+                    break
+                curr = ppid
+        except Exception:
+            break
+    return ancestors
+
+
+def are_pids_related(pid1: int, pid2: int) -> bool:
+    """Checks if two PIDs are in the same process family / tree."""
+    if pid1 == pid2:
+        return True
+    if pid1 <= 1 or pid2 <= 1:
+        return False
+    try:
+        a1 = get_process_ancestors(pid1)
+        a2 = get_process_ancestors(pid2)
+        if pid1 in a2 or pid2 in a1:
+            return True
+        common = a1.intersection(a2)
+        common.discard(1)
+        return len(common) > 0
+    except Exception:
+        return False
+
+
+def get_mpris_players() -> list:
+    """Discovers active MPRIS D-Bus player services on the session bus."""
+    try:
+        res = subprocess.run(
+            ["busctl", "--user", "call", "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "ListNames"],
+            capture_output=True,
+            text=True,
+            timeout=0.5
+        )
+        if res.returncode == 0:
+            return re.findall(r'"(org\.mpris\.MediaPlayer2\.[^"]+)"', res.stdout)
+    except Exception:
+        pass
+    return []
+
+
+def get_player_pid(service_name: str) -> int:
+    """Queries D-Bus for the UNIX PID of the given service name."""
+    try:
+        res = subprocess.run(
+            ["busctl", "--user", "call", "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "GetConnectionUnixProcessID", "s", service_name],
+            capture_output=True,
+            text=True,
+            timeout=0.5
+        )
+        if res.returncode == 0:
+            parts = res.stdout.strip().split()
+            if len(parts) >= 2 and parts[0] == "u":
+                return int(parts[1])
+    except Exception:
+        pass
+    return -1
+
+
+def get_player_status(service_name: str) -> str:
+    """Returns 'Playing', 'Paused', 'Stopped', or '' for the player."""
+    try:
+        res = subprocess.run(
+            ["busctl", "--user", "get-property", service_name, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player", "PlaybackStatus"],
+            capture_output=True,
+            text=True,
+            timeout=0.5
+        )
+        if res.returncode == 0:
+            m = re.search(r's\s+"([^"]+)"', res.stdout)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+    return ""
+
+
+def pause_window_media(window_data: dict):
+    """If media is actively playing in the window being closed, pauses it and returns player service name."""
+    if not window_data:
+        return None
+
+    win_pid = window_data.get("pid", -1)
+    win_class = (window_data.get("class") or "").lower()
+
+    players = get_mpris_players()
+    if not players:
+        return None
+
+    for player in players:
+        try:
+            status = get_player_status(player)
+            if status != "Playing":
+                continue
+
+            player_pid = get_player_pid(player)
+            is_match = False
+
+            # 1. Direct PID match (Spotify, VLC, MPV, music players, etc.)
+            if win_pid > 0 and player_pid == win_pid:
+                is_match = True
+            # 2. Process tree relationship (Browser renderers/audio helper processes)
+            elif win_pid > 0 and player_pid > 0 and are_pids_related(win_pid, player_pid):
+                is_match = True
+            # 3. Application class match fallback (e.g. "spotify" in "org.mpris.MediaPlayer2.spotify")
+            elif win_class and win_class in player.lower():
+                is_match = True
+
+            if is_match:
+                subprocess.run(
+                    ["busctl", "--user", "call", player, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player", "Pause"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=0.5
+                )
+                return player
+        except Exception:
+            continue
+
+    return None
+
+
+def resume_window_media(player_service: str):
+    """Sends a Play signal to resume playback on the specified player service."""
+    if not player_service:
+        return
+    try:
+        subprocess.run(
+            ["busctl", "--user", "call", player_service, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player", "Play"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=0.5
+        )
+    except Exception:
+        pass
+
+
 def action_close():
     """Handles Super+W close request."""
     sm = StateManager()
@@ -187,6 +337,11 @@ def action_close():
             hypr_dispatch(f'hl.dsp.window.close({{ window = "address:{addr}" }})')
             return
 
+        # Pause playing media if feature is enabled
+        paused_media = None
+        if state.get("pause_media", True):
+            paused_media = pause_window_media(active)
+
         now = time.time()
         countdown_enabled = state.get("countdown_enabled", True)
         countdown_seconds = state.get("countdown_seconds", int(DEFAULT_GRACE_PERIOD))
@@ -207,12 +362,16 @@ def action_close():
                 "title": title,
                 "class": app_class,
                 "timestamp": now,
-                "expires_at": None
+                "expires_at": None,
+                "paused_media": paused_media
             }
             queue.append(record)
             state["queue"] = queue
             sm.save(state)
-            show_osd("󰁯", "Rewind: Saved (Super+U to restore)", 1500)
+            if paused_media:
+                show_osd("󰝚", "Rewind: Saved (Media paused)", 1500)
+            else:
+                show_osd("󰁯", "Rewind: Saved (Super+U to restore)", 1500)
         else:
             # Countdown mode
             queue = [item for item in queue if item["address"] != addr]
@@ -223,7 +382,8 @@ def action_close():
                 "title": title,
                 "class": app_class,
                 "timestamp": now,
-                "expires_at": expires_at
+                "expires_at": expires_at,
+                "paused_media": paused_media
             }
             queue.append(record)
             state["queue"] = queue
@@ -233,7 +393,10 @@ def action_close():
             worker_addr = addr
             worker_now = str(now)
             worker_duration = str(countdown_seconds)
-            show_osd("󰁯", f"Rewind: {countdown_seconds}s grace", 1500)
+            if paused_media:
+                show_osd("󰝚", f"Rewind: {countdown_seconds}s grace (Media paused)", 1500)
+            else:
+                show_osd("󰁯", f"Rewind: {countdown_seconds}s grace", 1500)
 
     if spawn_worker:
         subprocess.Popen(
@@ -329,8 +492,16 @@ def action_restore():
     )
     hypr_dispatch(f'hl.dsp.focus({{ window = "address:{addr}" }})')
 
+    # Resume media playback if it was paused when closed
+    paused_player = target.get("paused_media")
+    if paused_player:
+        resume_window_media(paused_player)
+
     if move_ok:
-        show_osd("󰁪", f"Rewound {short_title}", 1500)
+        if paused_player:
+            show_osd("󰝚", f"Rewound {short_title} (Media resumed)", 1500)
+        else:
+            show_osd("󰁪", f"Rewound {short_title}", 1500)
     else:
         show_osd("󰁪", "Window no longer running", 1200)
 
@@ -405,6 +576,18 @@ def action_config(args):
                 for item in state.get("queue", []):
                     item["expires_at"] = None
                 show_osd("󰁯", "Rewind: Manual Mode", 1500)
+        elif "--toggle-media" in args:
+            curr = state.get("pause_media", True)
+            new_val = not curr
+            state["pause_media"] = new_val
+            msg = "Auto-Pause Media: ON" if new_val else "Auto-Pause Media: OFF"
+            show_osd("󰝚", msg, 1500)
+        elif "--enable-media" in args:
+            state["pause_media"] = True
+            show_osd("󰝚", "Auto-Pause Media: ON", 1500)
+        elif "--disable-media" in args:
+            state["pause_media"] = False
+            show_osd("󰝚", "Auto-Pause Media: OFF", 1500)
 
         sm.save(state)
 
@@ -614,6 +797,7 @@ def action_status():
             "enabled": state.get("enabled", True),
             "countdown_enabled": countdown_enabled,
             "countdown_seconds": countdown_seconds,
+            "pause_media": state.get("pause_media", True),
             "bindings_installed": are_bindings_installed(),
             "count": len(queue),
             "queue": queue,
@@ -661,7 +845,7 @@ def main():
         print("  setup               Configure shortcuts in ~/.config/hypr/bindings.lua")
         print("  remove-bindings     Remove shortcuts and restore Omarchy defaults")
         print("  uninstall           Completely uninstall Rewind and restore defaults")
-        print("  config ...          Configure grace period countdown")
+        print("  config ...          Configure countdown grace & media auto-pause")
         print("  status              Output state JSON")
     else:
         print(f"Unknown command: {cmd}")
