@@ -20,6 +20,7 @@ Accidentally closed your browser, terminal with running tasks, or editor? Rewind
 
 - **Instant Undo Grace Period**: Intercepts `Super + W` to softly move closed applications into dedicated hidden memory (`special:rewind`) without interrupting your desktop layout.
 - **Full State Preservation**: Because windows are retained in memory during the grace period, all running tasks, unsaved drafts, tabs, and terminal sessions remain intact.
+- **Grouped Windows**: Closing a grouped window saves only the selected member. The other members stay grouped on their workspace. The hidden tab keeps its original geometry so restoring it does not briefly expand over the group. Restore rejoins the original group at the same tab index, preserving its order and local lock. If original members disappeared, the saved window returns beside its surviving neighbours; if the group no longer exists or joining is refused, it restores separately in its original tiling or floating mode. If Hyprland refuses to detach the window (for example, when groups are globally locked), Rewind leaves it in place.
 - **Two Operating Modes**:
   - **Countdown Timer Mode (Default)**: Automatically terminates the application after a customizable countdown (default: 15s).
   - **Manual Indefinite Mode**: Disables the timer. The closed application remains safely in hidden memory until you restore it (`Super + U`) or close another window (which terminates the previous one and takes its place).
@@ -136,6 +137,14 @@ To re-enable Rewind shortcuts at any time, run `rewind setup` or click **Enable*
 - Utilities: `hyprctl`, `omarchy-shell`
 
 ---
+
+## Tests
+
+Run the regression tests with Python's standard library (no running desktop required):
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 ## License
 
