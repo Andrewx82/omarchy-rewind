@@ -72,18 +72,27 @@ class StateManager:
         os.replace(tmp, STATE_FILE)
 
 
-def hypr_dispatch(cmd: str):
-    """Executes a Hyprland dispatcher command."""
+def hypr_command(operation: str, cmd: str):
+    """Executes a Hyprland Lua command and checks its response."""
     try:
         res = subprocess.run(
-            ["hyprctl", "dispatch", cmd],
+            ["hyprctl", operation, cmd],
             capture_output=True,
             text=True,
             timeout=2
         )
-        return res.returncode == 0
+        # Lua dispatchers can report an error while hyprctl exits successfully.
+        return res.returncode == 0 and res.stdout.strip() == "ok"
     except Exception:
         return False
+
+
+def hypr_dispatch(cmd: str):
+    return hypr_command("dispatch", cmd)
+
+
+def hypr_eval(cmd: str):
+    return hypr_command("eval", cmd)
 
 
 def get_active_window():
@@ -119,6 +128,65 @@ def get_all_clients():
     except Exception:
         pass
     return []
+
+
+def restore_window_group(target: dict):
+    """Rejoin a surviving original group at the saved position."""
+    addr = target["address"]
+    members = target.get("group_members", [])
+    if addr not in members or len(members) < 2:
+        return False
+
+    original_index = members.index(addr)
+    clients = {client["address"]: client for client in get_all_clients()}
+    # Prefer a nearby surviving member. Ignore other windows still in Rewind.
+    peers = list(reversed(members[:original_index])) + members[original_index + 1:]
+    for peer_addr in peers:
+        peer = clients.get(peer_addr)
+        if not peer or peer.get("workspace", {}).get("name") == SPECIAL_WORKSPACE:
+            continue
+        group = peer.get("grouped", [])
+        if not group:
+            continue
+
+        # Preserve the position relative to surviving original neighbours.
+        # With an unchanged group this is exactly the original tab index.
+        before = next((member for member in reversed(members[:original_index]) if member in group), None)
+        after = next((member for member in members[original_index + 1:] if member in group), None)
+        if before:
+            index = group.index(before) + 1
+        elif after:
+            index = group.index(after)
+        else:
+            index = min(original_index, len(group))
+
+        # Group:add accepts an explicit one-based index and moves the window
+        # directly onto the group's workspace, without moving any peers.
+        # Temporarily release a local lock, then restore its current state,
+        # even if adding the window fails. Global locks remain in effect.
+        return hypr_eval(f'''
+local window = hl.get_window("address:{addr}")
+local peer = hl.get_window("address:{peer_addr}")
+assert(window and peer and peer.group, "Original group no longer exists")
+local group = peer.group
+assert(not window.group, "Saved window is already grouped")
+local locked = group.locked
+if locked then
+    hl.dispatch(hl.dsp.focus({{ window = peer }}))
+    hl.dispatch(hl.dsp.group.lock_active({{ action = "disable" }}))
+end
+local ok, err = pcall(function()
+    group:add(window, math.min({index + 1}, group.size + 1))
+end)
+if locked then
+    hl.dispatch(hl.dsp.focus({{ window = peer }}))
+    hl.dispatch(hl.dsp.group.lock_active({{ action = "enable" }}))
+end
+assert(ok, err)
+assert(window.group == group, "Could not restore original group")
+''')
+
+    return False
 
 
 def show_osd(icon: str, message: str, duration: int = 1500):
@@ -322,20 +390,41 @@ def action_close():
         ws_name = str(ws.get("name", ws.get("id", "1")))
         title = active.get("title", "") or active.get("class", "Window")
         app_class = active.get("class", "")
+        group_members = active.get("grouped", [])
 
         # If window is already on special:rewind, close it permanently
         if ws_name == SPECIAL_WORKSPACE:
             hypr_dispatch(f'hl.dsp.window.close({{ window = "address:{addr}" }})')
             return
 
-        # Move silently to special:rewind
-        move_success = hypr_dispatch(
-            f'hl.dsp.window.move({{ window = "address:{addr}", workspace = "{SPECIAL_WORKSPACE}", follow = false }})'
-        )
-
-        if not move_success:
-            hypr_dispatch(f'hl.dsp.window.close({{ window = "address:{addr}" }})')
-            return
+        # Detach and hide in one compositor request so the temporary tile is
+        # never rendered. Keep the hidden tab floating at its original geometry:
+        # tiling it on the special workspace would enlarge it, then animate that
+        # larger rectangle back over the group when restored.
+        if group_members:
+            move_success = hypr_eval(f'''
+local window = hl.get_window("address:{addr}")
+assert(window, "Saved window no longer exists")
+local at, size = window.at, window.size
+hl.dispatch(hl.dsp.window.move({{ window = window, out_of_group = true }}))
+assert(not window.group, "Could not detach window from group")
+hl.dispatch(hl.dsp.window.float({{ window = window, action = "enable" }}))
+hl.dispatch(hl.dsp.window.move({{ window = window, workspace = "{SPECIAL_WORKSPACE}", follow = false }}))
+hl.dispatch(hl.dsp.window.resize({{ window = window, x = size.x, y = size.y, relative = false }}))
+hl.dispatch(hl.dsp.window.move({{ window = window, x = at.x, y = at.y, relative = false }}))
+assert(window.workspace.name == "{SPECIAL_WORKSPACE}", "Could not hide window")
+''')
+            if not move_success:
+                show_osd("󰅖", "Rewind: Could not save grouped window", 1500)
+                return
+        else:
+            # Move silently to special:rewind
+            move_success = hypr_dispatch(
+                f'hl.dsp.window.move({{ window = "address:{addr}", workspace = "{SPECIAL_WORKSPACE}", follow = false }})'
+            )
+            if not move_success:
+                hypr_dispatch(f'hl.dsp.window.close({{ window = "address:{addr}" }})')
+                return
 
         # Pause playing media if feature is enabled
         paused_media = None
@@ -363,7 +452,9 @@ def action_close():
                 "class": app_class,
                 "timestamp": now,
                 "expires_at": None,
-                "paused_media": paused_media
+                "paused_media": paused_media,
+                "group_members": group_members,
+                "group_floating": active.get("floating", False)
             }
             queue.append(record)
             state["queue"] = queue
@@ -383,7 +474,9 @@ def action_close():
                 "class": app_class,
                 "timestamp": now,
                 "expires_at": expires_at,
-                "paused_media": paused_media
+                "paused_media": paused_media,
+                "group_members": group_members,
+                "group_floating": active.get("floating", False)
             }
             queue.append(record)
             state["queue"] = queue
@@ -486,10 +579,20 @@ def action_restore():
     raw_title = target.get("title", "Window")
     short_title = (raw_title[:18] + "…") if len(raw_title) > 18 else raw_title
 
-    # Move back to original workspace and focus
-    move_ok = hypr_dispatch(
-        f'hl.dsp.window.move({{ window = "address:{addr}", workspace = "{ws}", follow = true }})'
-    )
+    # Rejoin the original group directly, or restore to the workspace if it
+    # disappeared. Old queue records without group metadata remain compatible.
+    group_ok = restore_window_group(target)
+    move_ok = group_ok
+    if not move_ok:
+        # A saved tiled tab was floated only while hidden. If its group is gone,
+        # restore its original tiling mode before returning it to the workspace.
+        if target.get("group_members") and not target.get("group_floating", False):
+            hypr_dispatch(f'hl.dsp.window.float({{ window = "address:{addr}", action = "disable" }})')
+        move_ok = hypr_dispatch(
+            f'hl.dsp.window.move({{ window = "address:{addr}", workspace = "{ws}", follow = true }})'
+        )
+        if move_ok and target.get("group_members") == [addr]:
+            group_ok = hypr_dispatch(f'hl.dsp.group.toggle({{ window = "address:{addr}" }})')
     hypr_dispatch(f'hl.dsp.focus({{ window = "address:{addr}" }})')
 
     # Resume media playback if it was paused when closed
@@ -498,7 +601,9 @@ def action_restore():
         resume_window_media(paused_player)
 
     if move_ok:
-        if paused_player:
+        if target.get("group_members") and not group_ok:
+            show_osd("󰁪", f"Rewound {short_title} (Group unavailable)", 1500)
+        elif paused_player:
             show_osd("󰝚", f"Rewound {short_title} (Media resumed)", 1500)
         else:
             show_osd("󰁪", f"Rewound {short_title}", 1500)
