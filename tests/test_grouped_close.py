@@ -96,6 +96,8 @@ class WindowManager:
             client["floating"] = True
             client["workspace"]["name"] = "special:rewind"
             return True
+        if "toggle_special" in code or "hl.get_workspace_windows" in code:
+            return True
         if not self.join_allowed:
             return False
         address, peer = re.findall(r'hl.get_window\("address:([^"]+)"\)', code)
@@ -335,6 +337,69 @@ class GroupedCloseTests(unittest.TestCase):
         self.assert_remaining_group()
         self.assertNotIn("0x3", self.wm.clients)
         self.assertEqual(self.queue(), [])
+
+    def test_close_flushes_workspace_focus(self):
+        rewind.action_close()
+        self.assertTrue(any("hl.get_workspace_windows" in command for command in self.wm.commands))
+
+    def test_queued_hidden_window_refreshes_grace_without_destroy(self):
+        self.state["queue"] = [{
+            "address": "0x3",
+            "workspace": "1",
+            "title": "Test 0x3",
+            "class": "test-terminal",
+            "timestamp": 1000.0,
+            "expires_at": 1015.0,
+            "paused_media": None,
+            "group_members": ["0x1", "0x2", "0x3"],
+            "group_floating": False
+        }]
+        self.state["countdown_enabled"] = True
+        self.save_state()
+        self.wm.clients["0x3"]["workspace"]["name"] = "special:rewind"
+        rewind.action_close()
+        self.assertIn("0x3", self.wm.clients)
+        queue = self.queue()
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(queue[0]["address"], "0x3")
+        self.assertGreater(queue[0]["expires_at"], 1015.0)
+        self.show_osd.assert_called_once()
+
+    def test_restore_ensures_special_workspace_closed(self):
+        self.state["queue"] = [{
+            "address": "0x3",
+            "workspace": "1",
+            "title": "Test 0x3",
+            "class": "test-terminal",
+            "timestamp": 1000.0,
+            "expires_at": None,
+            "paused_media": None,
+            "group_members": ["0x1", "0x2", "0x3"],
+            "group_floating": False
+        }]
+        self.save_state()
+        self.wm.clients["0x3"]["workspace"]["name"] = "special:rewind"
+        rewind.action_restore()
+        self.assertTrue(any("toggle_special" in command for command in self.wm.commands))
+
+    def test_restore_does_not_leak_window_title_to_osd(self):
+        self.state["queue"] = [{
+            "address": "0x3",
+            "workspace": "1",
+            "title": "Confidential Document Title",
+            "class": "test-terminal",
+            "timestamp": 1000.0,
+            "expires_at": None,
+            "paused_media": None,
+            "group_members": [],
+            "group_floating": False
+        }]
+        self.save_state()
+        rewind.action_restore()
+        self.show_osd.assert_called_once()
+        osd_msg = self.show_osd.call_args.args[1]
+        self.assertNotIn("Confidential Document Title", osd_msg)
+        self.assertEqual(osd_msg, "Rewound window")
 
 
 class DispatcherTests(unittest.TestCase):

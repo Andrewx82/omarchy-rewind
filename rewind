@@ -19,10 +19,15 @@ STATE_FILE = STATE_DIR / "state.json"
 LOCK_FILE = STATE_DIR / "state.lock"
 SPECIAL_WORKSPACE = "special:rewind"
 DEFAULT_GRACE_PERIOD = 15.0  # seconds
+VERSION = "1.1.6"
 
 
 def ensure_state_dir():
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(STATE_DIR, 0o700)
+    except Exception:
+        pass
 
 
 class StateManager:
@@ -31,7 +36,8 @@ class StateManager:
         self.lock_fd = None
 
     def __enter__(self):
-        self.lock_fd = open(LOCK_FILE, "w+")
+        fd = os.open(LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+        self.lock_fd = os.fdopen(fd, "w+")
         fcntl.flock(self.lock_fd, fcntl.LOCK_EX)
         return self._load()
 
@@ -67,7 +73,8 @@ class StateManager:
 
     def save(self, data):
         tmp = STATE_FILE.with_suffix(".tmp")
-        with open(tmp, "w") as f:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
             json.dump(data, f, indent=2)
         os.replace(tmp, STATE_FILE)
 
@@ -364,6 +371,28 @@ def resume_window_media(player_service: str):
         pass
 
 
+def flush_workspace_focus(ws_name: str = None):
+    """Ensures Hyprland does not keep a hidden window as the active window,
+    and ensures special:rewind is closed so it never unexpectedly re-opens."""
+    return hypr_eval(f'''
+local spec = hl.get_active_special_workspace()
+if spec and spec.name == "{SPECIAL_WORKSPACE}" then
+    hl.dispatch(hl.dsp.workspace.toggle_special("rewind"))
+end
+
+local curr_ws = hl.get_active_workspace()
+local remaining = hl.get_workspace_windows(curr_ws)
+if remaining and #remaining > 0 then
+    hl.dispatch(hl.dsp.focus({{ window = remaining[1] }}))
+else
+    local curr_name = curr_ws.name
+    local other = (curr_name == "1") and "2" or "1"
+    hl.dispatch(hl.dsp.focus({{ workspace = other }}))
+    hl.dispatch(hl.dsp.focus({{ workspace = curr_name }}))
+end
+''')
+
+
 def action_close():
     """Handles Super+W close request."""
     sm = StateManager()
@@ -392,10 +421,43 @@ def action_close():
         app_class = active.get("class", "")
         group_members = active.get("grouped", [])
 
-        # If window is already on special:rewind, close it permanently
+        # If window is already on special:rewind:
+        # If managed in the Rewind queue, hide the workspace and renew grace period rather than destroying it.
         if ws_name == SPECIAL_WORKSPACE:
-            hypr_dispatch(f'hl.dsp.window.close({{ window = "address:{addr}" }})')
-            return
+            queue = state.get("queue", [])
+            in_queue = any(item.get("address") == addr for item in queue)
+            if in_queue:
+                flush_workspace_focus(ws_name)
+                countdown_enabled = state.get("countdown_enabled", True)
+                countdown_seconds = state.get("countdown_seconds", int(DEFAULT_GRACE_PERIOD))
+                now = time.time()
+                for item in queue:
+                    if item.get("address") == addr:
+                        if countdown_enabled:
+                            item["expires_at"] = now + countdown_seconds
+                            spawn_worker = True
+                            worker_addr = addr
+                            worker_now = str(now)
+                            worker_duration = str(countdown_seconds)
+                        break
+                state["queue"] = queue
+                sm.save(state)
+                if countdown_enabled:
+                    show_osd("󰁯", f"Rewind: {countdown_seconds}s grace", 1500)
+                else:
+                    show_osd("󰁯", "Rewind: Saved (Super+U to restore)", 1500)
+                notify_shell_widget()
+                if spawn_worker:
+                    subprocess.Popen(
+                        [sys.executable, __file__, "--expire", worker_addr, worker_now, worker_duration],
+                        start_new_session=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL
+                    )
+                return
+            else:
+                hypr_dispatch(f'hl.dsp.window.close({{ window = "address:{addr}" }})')
+                return
 
         # Detach and hide in one compositor request so the temporary tile is
         # never rendered. Keep the hidden tab floating at its original geometry:
@@ -425,6 +487,8 @@ assert(window.workspace.name == "{SPECIAL_WORKSPACE}", "Could not hide window")
             if not move_success:
                 hypr_dispatch(f'hl.dsp.window.close({{ window = "address:{addr}" }})')
                 return
+
+        flush_workspace_focus(ws_name)
 
         # Pause playing media if feature is enabled
         paused_media = None
@@ -576,8 +640,6 @@ def action_restore():
 
     addr = target["address"]
     ws = target["workspace"]
-    raw_title = target.get("title", "Window")
-    short_title = (raw_title[:18] + "…") if len(raw_title) > 18 else raw_title
 
     # Rejoin the original group directly, or restore to the workspace if it
     # disappeared. Old queue records without group metadata remain compatible.
@@ -595,6 +657,14 @@ def action_restore():
             group_ok = hypr_dispatch(f'hl.dsp.group.toggle({{ window = "address:{addr}" }})')
     hypr_dispatch(f'hl.dsp.focus({{ window = "address:{addr}" }})')
 
+    # Ensure special:rewind is closed if it was left active
+    hypr_eval(f'''
+local spec = hl.get_active_special_workspace()
+if spec and spec.name == "{SPECIAL_WORKSPACE}" then
+    hl.dispatch(hl.dsp.workspace.toggle_special("rewind"))
+end
+''')
+
     # Resume media playback if it was paused when closed
     paused_player = target.get("paused_media")
     if paused_player:
@@ -602,11 +672,11 @@ def action_restore():
 
     if move_ok:
         if target.get("group_members") and not group_ok:
-            show_osd("󰁪", f"Rewound {short_title} (Group unavailable)", 1500)
+            show_osd("󰁪", "Rewound window (Group unavailable)", 1500)
         elif paused_player:
-            show_osd("󰝚", f"Rewound {short_title} (Media resumed)", 1500)
+            show_osd("󰝚", "Rewound window (Media resumed)", 1500)
         else:
-            show_osd("󰁪", f"Rewound {short_title}", 1500)
+            show_osd("󰁪", "Rewound window", 1500)
     else:
         show_osd("󰁪", "Window no longer running", 1200)
 
@@ -937,6 +1007,8 @@ def main():
         action_uninstall()
     elif cmd in ("status", "--status"):
         action_status()
+    elif cmd in ("version", "-v", "--version"):
+        print(VERSION)
     elif cmd == "--expire" and len(sys.argv) >= 5:
         action_expire(sys.argv[2], sys.argv[3], sys.argv[4])
     elif cmd in ("-h", "--help", "help"):

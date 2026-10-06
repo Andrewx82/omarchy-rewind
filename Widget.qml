@@ -19,6 +19,7 @@ Panel {
   property int count: 0
   property bool bindingsInstalled: true
   property bool pauseMedia: true
+  readonly property string version: "1.1.6"
 
   readonly property string rewindBin: decodeURIComponent(Qt.resolvedUrl("rewind").toString().replace(/^file:\/\//, ""))
 
@@ -170,20 +171,19 @@ Panel {
     owner: root
     bar: root.bar
     open: root.opened
-    contentWidth: panel.fittedContentWidth(Style.space(350))
-    contentHeight: Math.max(Style.space(260), panel.fittedContentHeight(settingsColumn.childrenRect.height))
+    contentWidth: panel.fittedContentWidth(Style.space(380))
+    contentHeight: panel.fittedContentHeight(settingsColumn.implicitHeight)
 
     Column {
       id: settingsColumn
-      anchors.left: parent.left
-      anchors.right: parent.right
-      anchors.top: parent.top
+      width: parent.width
       spacing: Style.space(12)
 
       // Header
       Item {
         width: parent.width
         height: Style.space(28)
+        implicitHeight: height
 
         Row {
           anchors.fill: parent
@@ -212,10 +212,11 @@ Panel {
       BorderSurface {
         width: parent.width
         height: Style.space(72)
+        implicitHeight: visible ? height : 0
         visible: !root.bindingsInstalled
         radius: Style.cornerRadius
-        color: Style.normalFillFor(root.barForeground, Color.warning)
-        borderSpec: Border.controlSpec("normal", root.barForeground, Color.warning)
+        color: Style.normalFillFor(root.barForeground, Color.urgent)
+        borderSpec: Border.controlSpec("normal", root.barForeground, Color.urgent)
 
         Row {
           anchors.fill: parent
@@ -224,7 +225,7 @@ Panel {
 
           Text {
             text: "󰀦"
-            color: Color.warning
+            color: Color.urgent
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
             font.pixelSize: Style.font.title
             anchors.verticalCenter: parent.verticalCenter
@@ -256,7 +257,7 @@ Panel {
             height: Style.space(32)
             text: "Enable"
             bordered: true
-            accent: Color.warning
+            accent: Color.urgent
             anchors.verticalCenter: parent.verticalCenter
             onClicked: {
               if (root.bar) root.bar.run(root.rewindBin + " setup")
@@ -269,14 +270,18 @@ Panel {
       BorderSurface {
         width: parent.width
         height: Style.space(56)
+        implicitHeight: visible ? height : 0
         visible: root.bindingsInstalled
         radius: Style.cornerRadius
         color: Style.controlFill("normal", root.barForeground)
         borderSpec: Border.controlSpec("normal", root.barForeground)
 
         Row {
-          anchors.fill: parent
-          anchors.margins: Style.space(8)
+          anchors.left: parent.left
+          anchors.leftMargin: Style.space(10)
+          anchors.right: restoreBtn.left
+          anchors.rightMargin: Style.space(10)
+          anchors.verticalCenter: parent.verticalCenter
           spacing: Style.space(8)
 
           Text {
@@ -288,7 +293,6 @@ Panel {
           }
 
           Column {
-            width: parent.width - Style.space(146)
             anchors.verticalCenter: parent.verticalCenter
             spacing: Style.space(1)
 
@@ -307,16 +311,21 @@ Panel {
               font.pixelSize: Style.font.caption
             }
           }
+        }
 
-          Button {
-            width: Style.space(110)
-            height: Style.space(32)
-            text: "Restore Defaults"
-            bordered: true
-            anchors.verticalCenter: parent.verticalCenter
-            onClicked: {
-              if (root.bar) root.bar.run(root.rewindBin + " remove-bindings")
-            }
+        Button {
+          id: restoreBtn
+          width: Style.space(175)
+          height: Style.space(34)
+          fontSize: Style.font.bodySmall
+          horizontalPadding: Style.space(8)
+          text: "Restore Defaults"
+          bordered: true
+          anchors.right: parent.right
+          anchors.rightMargin: Style.space(10)
+          anchors.verticalCenter: parent.verticalCenter
+          onClicked: {
+            if (root.bar) root.bar.run(root.rewindBin + " remove-bindings")
           }
         }
       }
@@ -347,6 +356,7 @@ Panel {
       Item {
         width: parent.width
         height: Style.space(66)
+        implicitHeight: visible ? height : 0
         visible: root.countdownEnabled
 
         Column {
@@ -398,6 +408,7 @@ Panel {
       BorderSurface {
         width: parent.width
         height: Style.space(68)
+        implicitHeight: visible ? height : 0
         visible: !root.countdownEnabled
         radius: Style.cornerRadius
         color: Style.normalFillFor(root.barForeground, Color.accent)
@@ -443,6 +454,7 @@ Panel {
       Item {
         width: parent.width
         height: Style.space(76)
+        implicitHeight: visible ? height : 0
         visible: root.hasActiveUndo
 
         Column {
@@ -491,6 +503,24 @@ Panel {
               }
             }
           }
+        }
+      }
+
+      // Footer with version
+      Item {
+        width: parent.width
+        height: Style.space(20)
+        implicitHeight: height
+
+        Text {
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          text: "v" + root.version
+          textFormat: Text.PlainText
+          color: root.barForeground
+          opacity: 0.75
+          font.family: root.bar ? root.bar.fontFamily : Style.font.family
+          font.pixelSize: Style.font.caption
         }
       }
     }
