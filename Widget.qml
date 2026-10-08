@@ -19,7 +19,7 @@ Panel {
   property int count: 0
   property bool bindingsInstalled: true
   property bool pauseMedia: true
-  readonly property string version: "1.2.0"
+  readonly property string version: "1.2.1"
 
   readonly property string rewindBin: decodeURIComponent(Qt.resolvedUrl("rewind").toString().replace(/^file:\/\//, ""))
 

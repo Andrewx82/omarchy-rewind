@@ -20,7 +20,7 @@ STATE_FILE = STATE_DIR / "state.json"
 LOCK_FILE = STATE_DIR / "state.lock"
 SPECIAL_WORKSPACE = "special:rewind"
 DEFAULT_GRACE_PERIOD = 15.0  # seconds
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 
 
 def ensure_state_dir():
@@ -272,9 +272,9 @@ def terminate_window(addr: str, pid: int = None):
                         except (ProcessLookupError, OSError):
                             pass
 
-                    # Wait for graceful SIGTERM exit (up to 1.0s, polling every 0.1s)
+                    # Wait for graceful SIGTERM exit (up to 3.0s, polling every 0.1s)
                     still_alive = set(targets)
-                    for _ in range(10):
+                    for _ in range(30):
                         time.sleep(0.1)
                         alive_now = set()
                         for p in still_alive:
