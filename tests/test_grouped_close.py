@@ -4,6 +4,7 @@ import importlib.util
 import json
 import re
 import subprocess
+import signal
 import tempfile
 import unittest
 from pathlib import Path
@@ -33,10 +34,12 @@ class WindowManager:
                 "floating": False,
                 "at": [10, 20],
                 "size": [800, 400],
+                "pid": int(address, 16) + 1000,
             }
         self.active = addresses[-1]
         self.detach_allowed = True
         self.join_allowed = True
+        self.ignore_close = False
         self.commands = []
 
     def active_window(self):
@@ -64,6 +67,12 @@ class WindowManager:
             for member in client["grouped"] or [address]:
                 self.clients[member]["workspace"]["name"] = workspace
         elif "hl.dsp.window.close" in command:
+            if not self.ignore_close:
+                for member in client["grouped"]:
+                    if member != address:
+                        self.clients[member]["grouped"].remove(address)
+                del self.clients[address]
+        elif "hl.dsp.window.kill" in command:
             for member in client["grouped"]:
                 if member != address:
                     self.clients[member]["grouped"].remove(address)
@@ -141,7 +150,7 @@ class GroupedCloseTests(unittest.TestCase):
             patcher = patch.object(rewind, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
-        for name in ("show_osd", "notify_shell_widget", "pause_window_media"):
+        for name in ("show_osd", "notify_shell_widget", "pause_window_media", "mute_window_audio", "unmute_window_audio", "prepare_window_audio_for_close"):
             patcher = patch.object(rewind, name, return_value=None)
             setattr(self, name, patcher.start())
             self.addCleanup(patcher.stop)
@@ -414,6 +423,451 @@ class DispatcherTests(unittest.TestCase):
                 result = subprocess.CompletedProcess([], code, stdout=output, stderr="")
                 with patch.object(rewind.subprocess, "run", return_value=result):
                     self.assertEqual(rewind.hypr_dispatch("hl.dsp.window.move({ out_of_group = true })"), expected)
+
+
+class TerminationTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        self.wm = WindowManager()
+        self.state = {
+            "enabled": True,
+            "countdown_enabled": True,
+            "countdown_seconds": 15,
+            "pause_media": True,
+            "queue": [],
+        }
+        self.state_file = self.directory / "state.json"
+        self.state_file.write_text(json.dumps(self.state))
+        replacements = {
+            "STATE_DIR": self.directory,
+            "STATE_FILE": self.state_file,
+            "LOCK_FILE": self.directory / "state.lock",
+            "get_active_window": self.wm.active_window,
+            "get_all_clients": self.wm.all_clients,
+            "hypr_dispatch": self.wm.dispatch,
+            "hypr_eval": self.wm.evaluate,
+        }
+        for name, value in replacements.items():
+            patcher = patch.object(rewind, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for name in ("show_osd", "notify_shell_widget", "pause_window_media", "mute_window_audio", "unmute_window_audio", "prepare_window_audio_for_close"):
+            patcher = patch.object(rewind, name, return_value=None)
+            setattr(self, name, patcher.start())
+            self.addCleanup(patcher.stop)
+        patcher = patch.object(rewind.subprocess, "Popen")
+        self.worker = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_terminate_window_graceful_close(self):
+        # Window responds to window.close immediately
+        rewind.terminate_window("0x3", 1003)
+        self.assertNotIn("0x3", self.wm.clients)
+        close_cmds = [c for c in self.wm.commands if "hl.dsp.window.close" in c and "0x3" in c]
+        kill_cmds = [c for c in self.wm.commands if "hl.dsp.window.kill" in c and "0x3" in c]
+        self.assertEqual(len(close_cmds), 1)
+        self.assertEqual(len(kill_cmds), 0)
+
+    def test_terminate_window_fallback_to_force_kill(self):
+        # Window ignores window.close; compositor force kill is invoked
+        self.wm.ignore_close = True
+        with patch.object(rewind.time, "sleep"):
+            rewind.terminate_window("0x3", 1003)
+        self.assertNotIn("0x3", self.wm.clients)
+        close_cmds = [c for c in self.wm.commands if "hl.dsp.window.close" in c and "0x3" in c]
+        kill_cmds = [c for c in self.wm.commands if "hl.dsp.window.kill" in c and "0x3" in c]
+        self.assertEqual(len(close_cmds), 1)
+        self.assertEqual(len(kill_cmds), 1)
+
+    def test_terminate_window_signals_process_tree(self):
+        signals_sent = []
+        alive = {2000, 2001, 2002}
+
+        def mock_kill(pid, sig):
+            if sig == signal.SIGTERM:
+                alive.discard(pid)
+            elif sig == 0:
+                if pid not in alive:
+                    raise ProcessLookupError
+                return
+            signals_sent.append((pid, sig))
+
+        with patch.object(rewind, "get_process_tree", return_value={2001, 2002}), \
+             patch.object(rewind, "get_process_comm", return_value="game.exe"), \
+             patch.object(rewind.os, "kill", side_effect=mock_kill), \
+             patch.object(rewind.time, "sleep"):
+            rewind.terminate_window("0x3", 2000)
+
+        # Should send SIGTERM to root PID (2000) and descendants (2001, 2002)
+        sigterm_pids = {pid for pid, sig in signals_sent if sig == signal.SIGTERM}
+        self.assertEqual(sigterm_pids, {2000, 2001, 2002})
+        sigkill_pids = {pid for pid, sig in signals_sent if sig == signal.SIGKILL}
+        self.assertEqual(sigkill_pids, set())
+
+    def test_terminate_window_force_kills_surviving_processes(self):
+        signals_sent = []
+
+        def mock_kill(pid, sig):
+            signals_sent.append((pid, sig))
+
+        with patch.object(rewind, "get_process_tree", return_value={2001}), \
+             patch.object(rewind, "get_process_comm", return_value="game.exe"), \
+             patch.object(rewind.os, "kill", side_effect=mock_kill), \
+             patch.object(rewind.time, "sleep"):
+            rewind.terminate_window("0x3", 2000)
+
+        sigkill_pids = {pid for pid, sig in signals_sent if sig == signal.SIGKILL}
+        self.assertEqual(sigkill_pids, {2000, 2001})
+
+    def test_terminate_window_protects_multi_window_process(self):
+        signals_sent = []
+
+        def mock_kill(pid, sig):
+            signals_sent.append((pid, sig))
+
+        # Give 0x1 and 0x2 the same PID (multi-window app)
+        self.wm.clients["0x1"]["pid"] = 9999
+        self.wm.clients["0x2"]["pid"] = 9999
+
+        with patch.object(rewind, "get_process_tree", return_value=set()), \
+             patch.object(rewind, "get_process_comm", return_value="browser"), \
+             patch.object(rewind.os, "kill", side_effect=mock_kill):
+            rewind.terminate_window("0x1", 9999)
+
+        # 0x1 is closed, but 9999 is spared because 0x2 still exists with pid 9999
+        self.assertNotIn("0x1", self.wm.clients)
+        self.assertIn("0x2", self.wm.clients)
+        self.assertEqual(len(signals_sent), 0)
+
+    def test_terminate_window_protects_steam_and_system_processes(self):
+        signals_sent = []
+
+        def mock_kill(pid, sig):
+            signals_sent.append((pid, sig))
+
+        with patch.object(rewind, "get_process_comm", return_value="steam"), \
+             patch.object(rewind.os, "kill", side_effect=mock_kill):
+            rewind.terminate_window("0x3", 1003)
+
+        self.assertNotIn("0x3", self.wm.clients)
+        self.assertEqual(len(signals_sent), 0)
+
+    def test_action_close_stores_pid_in_record(self):
+        self.wm.clients["0x3"]["pid"] = 4321
+        rewind.action_close()
+        queue = json.loads(self.state_file.read_text())["queue"]
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(queue[0]["pid"], 4321)
+
+    def test_action_clear_terminates_all_queued(self):
+        self.state["queue"] = [
+            {"address": "0x1", "pid": 1001, "workspace": "1", "timestamp": 100},
+            {"address": "0x2", "pid": 1002, "workspace": "1", "timestamp": 100},
+        ]
+        self.state_file.write_text(json.dumps(self.state))
+
+        with patch.object(rewind, "terminate_window") as mock_term:
+            rewind.action_clear()
+            self.assertEqual(mock_term.call_count, 2)
+            mock_term.assert_any_call("0x1", 1001)
+            mock_term.assert_any_call("0x2", 1002)
+
+        queue = json.loads(self.state_file.read_text())["queue"]
+        self.assertEqual(queue, [])
+
+    def test_action_toggle_off_terminates_all_queued(self):
+        self.state["queue"] = [
+            {"address": "0x3", "pid": 1003, "workspace": "1", "timestamp": 100},
+        ]
+        self.state_file.write_text(json.dumps(self.state))
+
+        with patch.object(rewind, "terminate_window") as mock_term:
+            rewind.action_toggle()
+            mock_term.assert_called_once_with("0x3", 1003)
+
+        queue = json.loads(self.state_file.read_text())["queue"]
+        self.assertEqual(queue, [])
+
+    def test_get_process_tree_finds_nested_descendants(self):
+        fake_procs = {
+            "100": "100 (proc) S 1",
+            "101": "101 (proc) S 100",
+            "102": "102 (proc) S 100",
+            "103": "103 (proc) S 101",
+            "104": "104 (proc) S 1",
+            "105": "105 (proc) S 104",
+        }
+        class FakeEntry:
+            def __init__(self, name):
+                self.name = name
+                self.path = f"/fake_proc/{name}"
+            def is_dir(self):
+                return True
+
+        def fake_scandir(path):
+            return [FakeEntry(name) for name in fake_procs]
+
+        def fake_open(path, mode="r"):
+            pid = Path(path).parent.name
+            content = fake_procs.get(pid, "")
+            import io
+            return io.StringIO(content)
+
+        with patch("os.scandir", side_effect=fake_scandir), \
+             patch("builtins.open", side_effect=fake_open):
+            tree = rewind.get_process_tree(100)
+            self.assertEqual(tree, {101, 102, 103})
+
+
+class AudioMuteTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        self.wm = WindowManager()
+        self.state = {
+            "enabled": True,
+            "countdown_enabled": True,
+            "countdown_seconds": 15,
+            "pause_media": True,
+            "queue": [],
+        }
+        self.state_file = self.directory / "state.json"
+        self.state_file.write_text(json.dumps(self.state))
+        replacements = {
+            "STATE_DIR": self.directory,
+            "STATE_FILE": self.state_file,
+            "LOCK_FILE": self.directory / "state.lock",
+            "get_active_window": self.wm.active_window,
+            "get_all_clients": self.wm.all_clients,
+            "hypr_dispatch": self.wm.dispatch,
+            "hypr_eval": self.wm.evaluate,
+        }
+        for name, value in replacements.items():
+            patcher = patch.object(rewind, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for name in ("show_osd", "notify_shell_widget", "pause_window_media"):
+            patcher = patch.object(rewind, name, return_value=None)
+            setattr(self, name, patcher.start())
+            self.addCleanup(patcher.stop)
+        patcher = patch.object(rewind.subprocess, "Popen")
+        self.worker = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_mute_window_audio_dispatches_wpctl_and_pactl(self):
+        fake_pw_dump = [
+            {
+                "id": 50,
+                "type": "PipeWire:Interface:Client",
+                "info": {"props": {"application.process.id": 3000}},
+            },
+            {
+                "id": 75,
+                "type": "PipeWire:Interface:Node",
+                "info": {
+                    "props": {
+                        "media.class": "Stream/Output/Audio",
+                        "client.id": 50,
+                    }
+                },
+            },
+        ]
+        fake_pactl = (
+            "Sink Input #12\n"
+            "\tDriver: PipeWire\n"
+            "\tProperties:\n"
+            '\t\tapplication.process.id = "3000"\n'
+        )
+
+        run_cmds = []
+
+        def fake_run(cmd, *args, **kwargs):
+            run_cmds.append(cmd)
+            if cmd[0] == "pw-dump":
+                return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(fake_pw_dump), stderr="")
+            elif len(cmd) >= 2 and cmd[:2] == ["pactl", "list"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout=fake_pactl, stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with patch.object(rewind.subprocess, "run", side_effect=fake_run):
+            result = rewind.mute_window_audio({"pid": 3000, "class": "game"})
+
+        self.assertIsNotNone(result)
+        self.assertIn(75, result["nodes"])
+        self.assertIn(12, result["pactl"])
+
+        self.assertTrue(any(cmd == ["wpctl", "set-mute", "75", "1"] for cmd in run_cmds))
+        self.assertTrue(any(cmd == ["pactl", "set-sink-input-mute", "12", "1"] for cmd in run_cmds))
+
+    def test_unmute_window_audio_dispatches_unmute(self):
+        run_cmds = []
+
+        def fake_run(cmd, *args, **kwargs):
+            run_cmds.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with patch.object(rewind.subprocess, "run", side_effect=fake_run):
+            rewind.unmute_window_audio({
+                "pid": 3000,
+                "class": "game",
+                "muted_audio": {"nodes": [75], "pactl": [12]},
+            })
+
+        self.assertTrue(any(cmd == ["wpctl", "set-mute", "75", "0"] for cmd in run_cmds))
+        self.assertTrue(any(cmd == ["pactl", "set-sink-input-mute", "12", "0"] for cmd in run_cmds))
+
+    def test_action_close_mutes_audio_and_shows_osd(self):
+        with patch.object(rewind, "mute_window_audio", return_value={"nodes": [75], "pactl": [12]}):
+            rewind.action_close()
+
+        queue = json.loads(self.state_file.read_text())["queue"]
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(queue[0]["muted_audio"], {"nodes": [75], "pactl": [12]})
+
+        self.show_osd.assert_called_once()
+        osd_msg = self.show_osd.call_args.args[1]
+        self.assertIn("Audio muted", osd_msg)
+
+    def test_action_restore_unmutes_audio_and_shows_osd(self):
+        now = rewind.time.time()
+        self.state["queue"] = [{
+            "address": "0x3",
+            "workspace": "1",
+            "title": "Game",
+            "class": "game",
+            "pid": 1003,
+            "timestamp": now,
+            "expires_at": now + 100.0,
+            "paused_media": None,
+            "muted_audio": {"nodes": [75], "pactl": [12]},
+            "group_members": [],
+            "group_floating": False,
+        }]
+        self.state_file.write_text(json.dumps(self.state))
+        self.wm.clients["0x3"]["workspace"]["name"] = "special:rewind"
+
+        with patch.object(rewind, "unmute_window_audio") as mock_unmute:
+            rewind.action_restore()
+            mock_unmute.assert_called_once()
+            target = mock_unmute.call_args.args[0]
+            self.assertEqual(target["address"], "0x3")
+
+        self.show_osd.assert_called_once()
+        osd_msg = self.show_osd.call_args.args[1]
+        self.assertIn("Audio unmuted", osd_msg)
+
+    def test_prepare_window_audio_for_close_destroys_links_unmutes_and_sanitizes(self):
+        fake_pw_dump = [
+            {
+                "id": 99,
+                "type": "PipeWire:Interface:Link",
+                "info": {"props": {"link.output.node": 75}},
+            },
+        ]
+        run_cmds = []
+
+        def fake_run(cmd, *args, **kwargs):
+            run_cmds.append(cmd)
+            if cmd[0] == "pw-dump":
+                return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(fake_pw_dump), stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        wp_prop_dir = self.directory / ".local" / "state" / "wireplumber"
+        wp_prop_dir.mkdir(parents=True, exist_ok=True)
+        fake_wp_props = wp_prop_dir / "stream-properties"
+        fake_wp_props.write_text('Output/Audio:application.name:game={"mute":true, "volume":1.0}\n')
+
+        with patch.object(rewind.subprocess, "run", side_effect=fake_run), \
+             patch("pathlib.Path.home", return_value=self.directory):
+            rewind.prepare_window_audio_for_close({
+                "pid": 3000,
+                "class": "game",
+                "muted_audio": {"nodes": [75], "pactl": [12]},
+            })
+
+        # Links destroyed
+        self.assertTrue(any(cmd == ["pw-cli", "destroy", "99"] for cmd in run_cmds))
+        # Unmute sent
+        self.assertTrue(any(cmd == ["wpctl", "set-mute", "75", "0"] for cmd in run_cmds))
+        self.assertTrue(any(cmd == ["pactl", "set-sink-input-mute", "12", "0"] for cmd in run_cmds))
+        # Disk file sanitized
+        self.assertIn('"mute":false', fake_wp_props.read_text())
+
+    def test_action_expire_prepares_window_audio_for_close(self):
+        now = rewind.time.time()
+        self.state["queue"] = [{
+            "address": "0x3",
+            "workspace": "1",
+            "title": "Game",
+            "class": "game",
+            "pid": 1003,
+            "timestamp": now,
+            "expires_at": now + 0.1,
+            "paused_media": None,
+            "muted_audio": {"nodes": [75], "pactl": [12]},
+            "group_members": [],
+            "group_floating": False,
+        }]
+        self.state_file.write_text(json.dumps(self.state))
+
+        with patch.object(rewind, "prepare_window_audio_for_close") as mock_prep, \
+             patch.object(rewind, "terminate_window"):
+            rewind.action_expire("0x3", str(now), "0.0")
+            mock_prep.assert_called_once()
+            called_target = mock_prep.call_args.args[0]
+            self.assertEqual(called_target["address"], "0x3")
+            self.assertEqual(called_target["muted_audio"], {"nodes": [75], "pactl": [12]})
+
+    def test_action_clear_prepares_window_audio_for_close(self):
+        self.state["queue"] = [{
+            "address": "0x3",
+            "workspace": "1",
+            "title": "Game",
+            "class": "game",
+            "pid": 1003,
+            "timestamp": 100.0,
+            "expires_at": None,
+            "paused_media": None,
+            "muted_audio": {"nodes": [75], "pactl": [12]},
+            "group_members": [],
+            "group_floating": False,
+        }]
+        self.state_file.write_text(json.dumps(self.state))
+
+        with patch.object(rewind, "prepare_window_audio_for_close") as mock_prep, \
+             patch.object(rewind, "terminate_window"):
+            rewind.action_clear()
+            mock_prep.assert_called_once()
+            called_target = mock_prep.call_args.args[0]
+            self.assertEqual(called_target["address"], "0x3")
+            self.assertEqual(called_target["muted_audio"], {"nodes": [75], "pactl": [12]})
+
+    def test_action_toggle_off_prepares_window_audio_for_close(self):
+        self.state["queue"] = [{
+            "address": "0x3",
+            "workspace": "1",
+            "title": "Game",
+            "class": "game",
+            "pid": 1003,
+            "timestamp": 100.0,
+            "expires_at": None,
+            "paused_media": None,
+            "muted_audio": {"nodes": [75], "pactl": [12]},
+            "group_members": [],
+            "group_floating": False,
+        }]
+        self.state_file.write_text(json.dumps(self.state))
+
+        with patch.object(rewind, "prepare_window_audio_for_close") as mock_prep, \
+             patch.object(rewind, "terminate_window"):
+            rewind.action_toggle()
+            mock_prep.assert_called_once()
+            called_target = mock_prep.call_args.args[0]
+            self.assertEqual(called_target["address"], "0x3")
+            self.assertEqual(called_target["muted_audio"], {"nodes": [75], "pactl": [12]})
 
 
 if __name__ == "__main__":

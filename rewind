@@ -12,6 +12,7 @@ import time
 import fcntl
 import shutil
 import subprocess
+import signal
 from pathlib import Path
 
 STATE_DIR = Path.home() / ".local" / "state" / "omarchy" / "rewind"
@@ -19,7 +20,7 @@ STATE_FILE = STATE_DIR / "state.json"
 LOCK_FILE = STATE_DIR / "state.lock"
 SPECIAL_WORKSPACE = "special:rewind"
 DEFAULT_GRACE_PERIOD = 15.0  # seconds
-VERSION = "1.1.6"
+VERSION = "1.2.0"
 
 
 def ensure_state_dir():
@@ -135,6 +136,164 @@ def get_all_clients():
     except Exception:
         pass
     return []
+
+
+PROTECTED_COMM = {
+    "systemd",
+    "init",
+    "hyprland",
+    "waybar",
+    "omarchy-shell",
+    "pipewire",
+    "wireplumber",
+    "dbus-daemon",
+    "dbus-broker",
+    "steam",
+    "steamwebhelper",
+    "polkitd",
+    "xdg-desktop-por",
+    "xdg-desktop-portal",
+    "xdg-desktop-portal-hyprland",
+    "xwayland",
+    "footserver",
+}
+
+
+def get_process_comm(pid: int) -> str:
+    """Returns the comm (process name) for a given PID from /proc."""
+    try:
+        with open(f"/proc/{pid}/comm", "r") as f:
+            return f.read().strip()
+    except (OSError, IOError):
+        return ""
+
+
+def get_process_tree(root_pid: int) -> set:
+    """Finds all descendant PIDs of root_pid by scanning /proc."""
+    if not root_pid or not isinstance(root_pid, int) or root_pid <= 1:
+        return set()
+
+    ppid_map = {}
+    try:
+        for entry in os.scandir("/proc"):
+            if entry.is_dir() and entry.name.isdigit():
+                try:
+                    stat_path = os.path.join(entry.path, "stat")
+                    with open(stat_path, "r") as f:
+                        content = f.read()
+                    rparen = content.rfind(")")
+                    if rparen != -1:
+                        parts = content[rparen + 1:].split()
+                        ppid = int(parts[1])
+                        ppid_map.setdefault(ppid, []).append(int(entry.name))
+                except (OSError, IOError, IndexError, ValueError):
+                    pass
+    except OSError:
+        pass
+
+    descendants = set()
+    queue = [root_pid]
+    while queue:
+        curr = queue.pop()
+        for child in ppid_map.get(curr, []):
+            if child not in descendants and child > 1:
+                descendants.add(child)
+                queue.append(child)
+
+    return descendants
+
+
+def terminate_window(addr: str, pid: int = None):
+    """
+    Permanently and reliably terminates a window and its process tree:
+    1. Attempts graceful close via hl.dsp.window.close.
+    2. If the window surface remains after polling, force-kills it via hl.dsp.window.kill.
+    3. If the process is still running and owns no other open windows, cleanly terminates
+       it and its descendant processes (SIGTERM, then SIGKILL if still alive).
+    """
+    if not addr:
+        return
+
+    # Check current compositor clients
+    all_clients = get_all_clients()
+    target_client = next((c for c in all_clients if c.get("address") == addr), None)
+    if pid is None and target_client:
+        pid = target_client.get("pid")
+
+    client_class = target_client.get("class", "") if target_client else ""
+    prepare_window_audio_for_close({"address": addr, "pid": pid, "class": client_class})
+
+    if target_client is not None:
+        # Phase 1: Graceful close request
+        hypr_dispatch(f'hl.dsp.window.close({{ window = "address:{addr}" }})')
+
+        # Check / poll to see if window closed gracefully (up to 2.0s)
+        closed = not any(c.get("address") == addr for c in get_all_clients())
+        if not closed:
+            for _ in range(40):
+                time.sleep(0.05)
+                if not any(c.get("address") == addr for c in get_all_clients()):
+                    closed = True
+                    break
+
+        # Phase 2: Force-kill via compositor if still present
+        if not closed:
+            hypr_dispatch(f'hl.dsp.window.kill({{ window = "address:{addr}" }})')
+            closed = not any(c.get("address") == addr for c in get_all_clients())
+            if not closed:
+                for _ in range(10):
+                    time.sleep(0.05)
+                    if not any(c.get("address") == addr for c in get_all_clients()):
+                        closed = True
+                        break
+
+    # Phase 3: Process tree cleanup
+    if pid and isinstance(pid, int) and pid > 1 and pid != os.getpid() and pid != os.getppid():
+        # Safety check: do not kill if another open window shares this PID
+        remaining = get_all_clients()
+        shares_pid = any(c.get("address") != addr and c.get("pid") == pid for c in remaining)
+        if not shares_pid:
+            comm = get_process_comm(pid).lower()
+            if comm not in PROTECTED_COMM:
+                try:
+                    os.kill(pid, 0)
+                    is_alive = True
+                except (ProcessLookupError, OSError):
+                    is_alive = False
+
+                if is_alive:
+                    descendants = get_process_tree(pid)
+                    targets = descendants | {pid}
+
+                    # Attempt graceful SIGTERM first
+                    for p in targets:
+                        try:
+                            os.kill(p, signal.SIGTERM)
+                        except (ProcessLookupError, OSError):
+                            pass
+
+                    # Wait for graceful SIGTERM exit (up to 1.0s, polling every 0.1s)
+                    still_alive = set(targets)
+                    for _ in range(10):
+                        time.sleep(0.1)
+                        alive_now = set()
+                        for p in still_alive:
+                            try:
+                                os.kill(p, 0)
+                                alive_now.add(p)
+                            except (ProcessLookupError, OSError):
+                                pass
+                        still_alive = alive_now
+                        if not still_alive:
+                            break
+
+                    # Force kill with SIGKILL only if any processes remain alive after SIGTERM timeout
+                    if still_alive:
+                        for p in still_alive:
+                            try:
+                                os.kill(p, signal.SIGKILL)
+                            except (ProcessLookupError, OSError):
+                                pass
 
 
 def restore_window_group(target: dict):
@@ -371,6 +530,206 @@ def resume_window_media(player_service: str):
         pass
 
 
+def get_window_audio_streams(target_pids: set, win_class: str = "") -> tuple[set, set]:
+    """Returns (node_ids, pactl_indices) matching the target PIDs or window class."""
+    node_ids = set()
+    pactl_indices = set()
+
+    # 1. PipeWire / WirePlumber (native nodes)
+    try:
+        res = subprocess.run(["pw-dump"], capture_output=True, text=True, timeout=0.8)
+        if res.returncode == 0 and res.stdout.strip():
+            data = json.loads(res.stdout)
+            client_to_pid = {}
+            for item in data:
+                if item.get("type") == "PipeWire:Interface:Client":
+                    props = item.get("info", {}).get("props", {})
+                    pid = props.get("application.process.id") or props.get("pipewire.sec.pid")
+                    if pid:
+                        try:
+                            client_to_pid[item.get("id")] = int(pid)
+                        except (ValueError, TypeError):
+                            pass
+
+            for item in data:
+                if item.get("type") == "PipeWire:Interface:Node":
+                    props = item.get("info", {}).get("props", {})
+                    if props.get("media.class") == "Stream/Output/Audio":
+                        node_id = item.get("id")
+                        client_id = props.get("client.id")
+                        stream_pid = props.get("application.process.id") or client_to_pid.get(client_id)
+                        try:
+                            stream_pid = int(stream_pid) if stream_pid is not None else None
+                        except (ValueError, TypeError):
+                            stream_pid = None
+
+                        app_name = (props.get("application.name") or props.get("node.name") or "").lower()
+                        binary = (props.get("application.process.binary") or "").lower()
+
+                        is_match = False
+                        if stream_pid and stream_pid in target_pids:
+                            is_match = True
+                        elif win_class and (win_class == app_name or win_class == binary):
+                            is_match = True
+
+                        if is_match and node_id:
+                            node_ids.add(node_id)
+    except Exception:
+        pass
+
+    # 2. PulseAudio / pactl (sink-inputs)
+    try:
+        res = subprocess.run(["pactl", "list", "sink-inputs"], capture_output=True, text=True, timeout=0.8)
+        if res.returncode == 0:
+            curr_idx = None
+            curr_pid = None
+            curr_name = ""
+            for line in res.stdout.splitlines():
+                line = line.strip()
+                m = re.match(r"^Sink Input #(\d+)", line)
+                if m:
+                    if curr_idx is not None:
+                        if (curr_pid and curr_pid in target_pids) or (win_class and win_class in curr_name.lower()):
+                            pactl_indices.add(curr_idx)
+                    curr_idx = int(m.group(1))
+                    curr_pid = None
+                    curr_name = ""
+                elif "application.process.id =" in line:
+                    val = line.split("=")[-1].strip().strip('"')
+                    if val.isdigit():
+                        curr_pid = int(val)
+                elif "application.name =" in line or "application.process.binary =" in line:
+                    curr_name += " " + line.split("=")[-1].strip().strip('"')
+            if curr_idx is not None:
+                if (curr_pid and curr_pid in target_pids) or (win_class and win_class in curr_name.lower()):
+                    pactl_indices.add(curr_idx)
+    except Exception:
+        pass
+
+    return node_ids, pactl_indices
+
+
+def mute_window_audio(window_data: dict) -> dict:
+    """Mutes active PipeWire and PulseAudio streams for the window process tree."""
+    if not window_data:
+        return None
+    win_pid = window_data.get("pid", -1)
+    win_class = (window_data.get("class") or "").lower()
+    target_pids = ({win_pid} | get_process_tree(win_pid)) if win_pid and win_pid > 0 else set()
+
+    nodes, pactl_idxs = get_window_audio_streams(target_pids, win_class)
+    for node_id in nodes:
+        subprocess.run(["wpctl", "set-mute", str(node_id), "1"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=0.5)
+    for idx in pactl_idxs:
+        subprocess.run(["pactl", "set-sink-input-mute", str(idx), "1"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=0.5)
+
+    if nodes or pactl_idxs:
+        return {"nodes": list(nodes), "pactl": list(pactl_idxs)}
+    return None
+
+
+def unmute_window_audio(target: dict):
+    """Unmutes audio streams for the restored window."""
+    if not target:
+        return
+    win_pid = target.get("pid", -1)
+    win_class = (target.get("class") or "").lower()
+    target_pids = ({win_pid} | get_process_tree(win_pid)) if win_pid and win_pid > 0 else set()
+
+    # Unmute recorded nodes & pactl streams
+    muted_info = target.get("muted_audio") or {}
+    nodes_to_unmute = set(muted_info.get("nodes", []))
+    pactl_to_unmute = set(muted_info.get("pactl", []))
+
+    # Also discover and unmute any currently active streams for this window
+    curr_nodes, curr_pactl = get_window_audio_streams(target_pids, win_class)
+    nodes_to_unmute.update(curr_nodes)
+    pactl_to_unmute.update(curr_pactl)
+
+    for node_id in nodes_to_unmute:
+        subprocess.run(["wpctl", "set-mute", str(node_id), "0"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=0.5)
+    for idx in pactl_to_unmute:
+        subprocess.run(["pactl", "set-sink-input-mute", str(idx), "0"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=0.5)
+
+
+def prepare_window_audio_for_close(target: dict):
+    """
+    Prepares window audio streams before permanent termination:
+    1. Sever active PipeWire links to output sinks so unmuting causes zero audible sound leakage.
+    2. Unmute PipeWire nodes and PulseAudio sink-inputs while the process is still alive,
+       so WirePlumber and PulseAudio stream-restore record the stream as unmuted (mute: false).
+       This ensures subsequent fresh launches of the application start unmuted.
+    3. Sanitize WirePlumber stream-properties on disk if any lingering mute flags exist.
+    """
+    if not target or not isinstance(target, dict):
+        return
+
+    win_pid = target.get("pid", -1)
+    win_class = (target.get("class") or "").lower()
+    if not win_class and win_pid and isinstance(win_pid, int) and win_pid > 0:
+        win_class = get_process_comm(win_pid).lower()
+
+    target_pids = ({win_pid} | get_process_tree(win_pid)) if win_pid and isinstance(win_pid, int) and win_pid > 0 else set()
+
+    # Streams previously recorded when muted + any active streams currently open
+    muted_info = target.get("muted_audio") or {}
+    node_ids = set(muted_info.get("nodes", []))
+    pactl_idxs = set(muted_info.get("pactl", []))
+
+    curr_nodes, curr_pactl = get_window_audio_streams(target_pids, win_class)
+    node_ids.update(curr_nodes)
+    pactl_idxs.update(curr_pactl)
+
+    # 1. Disconnect active output links so unmuting doesn't cause an audio pop or burst
+    if node_ids:
+        try:
+            res = subprocess.run(["pw-dump"], capture_output=True, text=True, timeout=0.8)
+            if res.returncode == 0 and res.stdout.strip():
+                data = json.loads(res.stdout)
+                for item in data:
+                    if item.get("type") == "PipeWire:Interface:Link":
+                        props = item.get("info", {}).get("props", {})
+                        if props.get("link.output.node") in node_ids:
+                            link_id = item.get("id")
+                            if link_id:
+                                subprocess.run(
+                                    ["pw-cli", "destroy", str(link_id)],
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL,
+                                    timeout=0.5
+                                )
+        except Exception:
+            pass
+
+    # 2. Unmute nodes and sink-inputs so stream-restore saves mute: false
+    for node_id in node_ids:
+        subprocess.run(["wpctl", "set-mute", str(node_id), "0"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=0.5)
+    for idx in pactl_idxs:
+        subprocess.run(["pactl", "set-sink-input-mute", str(idx), "0"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=0.5)
+
+    # 3. Sanitize WirePlumber stream-properties file on disk
+    try:
+        wp_prop_file = Path.home() / ".local" / "state" / "wireplumber" / "stream-properties"
+        if wp_prop_file.exists():
+            content = wp_prop_file.read_text(encoding="utf-8")
+            if '"mute":true' in content or '"mute": true' in content:
+                new_lines = []
+                changed = False
+                norm_class = win_class.lower().strip()
+                for line in content.splitlines():
+                    if '"mute":true' in line or '"mute": true' in line:
+                        norm_line = line.lower().replace(r"\s", " ").replace(r"\o", "").replace(r"\c", "")
+                        match_class = (not norm_class) or (norm_class in norm_line) or (norm_class.replace("-", " ") in norm_line) or (norm_class.replace("_", " ") in norm_line)
+                        if match_class:
+                            line = line.replace('"mute":true', '"mute":false').replace('"mute": true', '"mute": false')
+                            changed = True
+                    new_lines.append(line)
+                if changed:
+                    wp_prop_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
 def flush_workspace_focus(ws_name: str = None):
     """Ensures Hyprland does not keep a hidden window as the active window,
     and ensures special:rewind is closed so it never unexpectedly re-opens."""
@@ -439,6 +798,8 @@ def action_close():
                             worker_addr = addr
                             worker_now = str(now)
                             worker_duration = str(countdown_seconds)
+                        if "pid" not in item and active.get("pid"):
+                            item["pid"] = active.get("pid")
                         break
                 state["queue"] = queue
                 sm.save(state)
@@ -456,7 +817,7 @@ def action_close():
                     )
                 return
             else:
-                hypr_dispatch(f'hl.dsp.window.close({{ window = "address:{addr}" }})')
+                terminate_window(addr, active.get("pid"))
                 return
 
         # Detach and hide in one compositor request so the temporary tile is
@@ -485,15 +846,17 @@ assert(window.workspace.name == "{SPECIAL_WORKSPACE}", "Could not hide window")
                 f'hl.dsp.window.move({{ window = "address:{addr}", workspace = "{SPECIAL_WORKSPACE}", follow = false }})'
             )
             if not move_success:
-                hypr_dispatch(f'hl.dsp.window.close({{ window = "address:{addr}" }})')
+                terminate_window(addr, active.get("pid"))
                 return
 
         flush_workspace_focus(ws_name)
 
-        # Pause playing media if feature is enabled
+        # Pause playing media and mute window audio if feature is enabled
         paused_media = None
+        muted_audio = None
         if state.get("pause_media", True):
             paused_media = pause_window_media(active)
+            muted_audio = mute_window_audio(active)
 
         now = time.time()
         countdown_enabled = state.get("countdown_enabled", True)
@@ -506,7 +869,8 @@ assert(window.workspace.name == "{SPECIAL_WORKSPACE}", "Could not hide window")
             for old in queue:
                 old_addr = old.get("address")
                 if old_addr and old_addr != addr:
-                    hypr_dispatch(f'hl.dsp.window.close({{ window = "address:{old_addr}" }})')
+                    prepare_window_audio_for_close(old)
+                    terminate_window(old_addr, old.get("pid"))
 
             queue = []
             record = {
@@ -514,9 +878,11 @@ assert(window.workspace.name == "{SPECIAL_WORKSPACE}", "Could not hide window")
                 "workspace": ws_name,
                 "title": title,
                 "class": app_class,
+                "pid": active.get("pid"),
                 "timestamp": now,
                 "expires_at": None,
                 "paused_media": paused_media,
+                "muted_audio": muted_audio,
                 "group_members": group_members,
                 "group_floating": active.get("floating", False)
             }
@@ -525,6 +891,8 @@ assert(window.workspace.name == "{SPECIAL_WORKSPACE}", "Could not hide window")
             sm.save(state)
             if paused_media:
                 show_osd("󰝚", "Rewind: Saved (Media paused)", 1500)
+            elif muted_audio:
+                show_osd("󰝟", "Rewind: Saved (Audio muted)", 1500)
             else:
                 show_osd("󰁯", "Rewind: Saved (Super+U to restore)", 1500)
         else:
@@ -536,9 +904,11 @@ assert(window.workspace.name == "{SPECIAL_WORKSPACE}", "Could not hide window")
                 "workspace": ws_name,
                 "title": title,
                 "class": app_class,
+                "pid": active.get("pid"),
                 "timestamp": now,
                 "expires_at": expires_at,
                 "paused_media": paused_media,
+                "muted_audio": muted_audio,
                 "group_members": group_members,
                 "group_floating": active.get("floating", False)
             }
@@ -552,6 +922,8 @@ assert(window.workspace.name == "{SPECIAL_WORKSPACE}", "Could not hide window")
             worker_duration = str(countdown_seconds)
             if paused_media:
                 show_osd("󰝚", f"Rewind: {countdown_seconds}s grace (Media paused)", 1500)
+            elif muted_audio:
+                show_osd("󰝟", f"Rewind: {countdown_seconds}s grace (Audio muted)", 1500)
             else:
                 show_osd("󰁯", f"Rewind: {countdown_seconds}s grace", 1500)
 
@@ -597,16 +969,15 @@ def action_expire(addr: str, timestamp_str: str, duration_str: str):
             # Expiration was cancelled or deadline was extended
             return
 
+        target_pid = target.get("pid")
+
         # Remove from queue
         state["queue"] = [item for item in queue if not (item["address"] == addr and abs(item["timestamp"] - ts) < 0.05)]
         sm.save(state)
 
-    # Permanently close window if still in clients
-    clients = get_all_clients()
-    for client in clients:
-        if client.get("address") == addr:
-            hypr_dispatch(f'hl.dsp.window.close({{ window = "address:{addr}" }})')
-            break
+    # Permanently close window and cleanup process tree
+    prepare_window_audio_for_close(target)
+    terminate_window(addr, target_pid)
 
     notify_shell_widget()
 
@@ -670,11 +1041,18 @@ end
     if paused_player:
         resume_window_media(paused_player)
 
+    # Unmute window audio streams if any were muted
+    muted_audio = target.get("muted_audio")
+    if muted_audio:
+        unmute_window_audio(target)
+
     if move_ok:
         if target.get("group_members") and not group_ok:
             show_osd("󰁪", "Rewound window (Group unavailable)", 1500)
         elif paused_player:
             show_osd("󰝚", "Rewound window (Media resumed)", 1500)
+        elif muted_audio:
+            show_osd("󰕾", "Rewound window (Audio unmuted)", 1500)
         else:
             show_osd("󰁪", "Rewound window", 1500)
     else:
@@ -686,6 +1064,7 @@ end
 def action_toggle():
     """Toggles the Rewind feature ON/OFF with OSD display."""
     sm = StateManager()
+    to_terminate = []
     with sm as state:
         current = state.get("enabled", True)
         new_val = not current
@@ -694,11 +1073,16 @@ def action_toggle():
         # If turning OFF, permanently close any currently queued windows
         if not new_val:
             for item in state.get("queue", []):
-                addr = item["address"]
-                hypr_dispatch(f'hl.dsp.window.close({{ window = "address:{addr}" }})')
+                addr = item.get("address")
+                if addr:
+                    to_terminate.append(item)
             state["queue"] = []
 
         sm.save(state)
+
+    for item in to_terminate:
+        prepare_window_audio_for_close(item)
+        terminate_window(item.get("address"), item.get("pid"))
 
     if new_val:
         show_osd("󰁯", "Rewind: ON", 1500)
@@ -772,13 +1156,19 @@ def action_config(args):
 def action_clear():
     """Permanently closes any queued/hidden windows and clears the queue."""
     sm = StateManager()
+    to_terminate = []
     with sm as state:
         for item in state.get("queue", []):
             addr = item.get("address")
             if addr:
-                hypr_dispatch(f'hl.dsp.window.close({{ window = "address:{addr}" }})')
+                to_terminate.append(item)
         state["queue"] = []
         sm.save(state)
+
+    for item in to_terminate:
+        prepare_window_audio_for_close(item)
+        terminate_window(item.get("address"), item.get("pid"))
+
     show_osd("󰅖", "Rewind: Cleared", 1200)
     notify_shell_widget()
 
@@ -1011,6 +1401,11 @@ def main():
         print(VERSION)
     elif cmd == "--expire" and len(sys.argv) >= 5:
         action_expire(sys.argv[2], sys.argv[3], sys.argv[4])
+    elif cmd == "--terminate" and len(sys.argv) >= 3:
+        target_pid = None
+        if len(sys.argv) >= 4 and sys.argv[3].isdigit():
+            target_pid = int(sys.argv[3])
+        terminate_window(sys.argv[2], target_pid)
     elif cmd in ("-h", "--help", "help"):
         print("Rewind - Window Grace Period & Undo Restore for Omarchy\n")
         print("Commands:")

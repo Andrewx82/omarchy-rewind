@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "omarchy-rewind",
   "name": "Rewind",
-  "version": "1.1.6",
+  "version": "1.2.0",
   "author": "Andrew",
   "description": "Instant undo and grace period for closed applications",
   "kinds": [
