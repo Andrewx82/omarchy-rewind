@@ -20,7 +20,7 @@ STATE_FILE = STATE_DIR / "state.json"
 LOCK_FILE = STATE_DIR / "state.lock"
 SPECIAL_WORKSPACE = "special:rewind"
 DEFAULT_GRACE_PERIOD = 15.0  # seconds
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 
 
 def ensure_state_dir():
@@ -401,7 +401,7 @@ def get_process_ancestors(pid: int) -> set:
 
 
 def are_pids_related(pid1: int, pid2: int) -> bool:
-    """Checks if two PIDs are in the same process family / tree."""
+    """Checks if two PIDs are in the same process hierarchy (direct ancestor or descendant)."""
     if pid1 == pid2:
         return True
     if pid1 <= 1 or pid2 <= 1:
@@ -409,11 +409,7 @@ def are_pids_related(pid1: int, pid2: int) -> bool:
     try:
         a1 = get_process_ancestors(pid1)
         a2 = get_process_ancestors(pid2)
-        if pid1 in a2 or pid2 in a1:
-            return True
-        common = a1.intersection(a2)
-        common.discard(1)
-        return len(common) > 0
+        return pid1 in a2 or pid2 in a1
     except Exception:
         return False
 

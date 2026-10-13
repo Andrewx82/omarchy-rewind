@@ -620,6 +620,37 @@ class TerminationTests(unittest.TestCase):
             tree = rewind.get_process_tree(100)
             self.assertEqual(tree, {101, 102, 103})
 
+    def test_are_pids_related_detects_direct_ancestry(self):
+        def fake_ancestors(pid):
+            if pid == 105:
+                return {105, 100, 50, 1}
+            elif pid == 100:
+                return {100, 50, 1}
+            elif pid == 50:
+                return {50, 1}
+            return {pid, 1}
+
+        with patch.object(rewind, "get_process_ancestors", side_effect=fake_ancestors):
+            self.assertTrue(rewind.are_pids_related(100, 105))
+            self.assertTrue(rewind.are_pids_related(105, 100))
+            self.assertTrue(rewind.are_pids_related(50, 105))
+            self.assertTrue(rewind.are_pids_related(105, 50))
+            self.assertTrue(rewind.are_pids_related(100, 100))
+
+    def test_are_pids_related_rejects_unrelated_session_cousins(self):
+        def fake_ancestors(pid):
+            if pid == 1404838:
+                return {1404838, 1599, 1593, 1457, 1}
+            elif pid == 6602:
+                return {6602, 4614, 1457, 1}
+            return {pid, 1}
+
+        with patch.object(rewind, "get_process_ancestors", side_effect=fake_ancestors):
+            self.assertFalse(rewind.are_pids_related(1404838, 6602))
+            self.assertFalse(rewind.are_pids_related(6602, 1404838))
+            self.assertFalse(rewind.are_pids_related(0, 6602))
+            self.assertFalse(rewind.are_pids_related(1404838, 1))
+
 
 class AudioMuteTests(unittest.TestCase):
     def setUp(self):
