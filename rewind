@@ -20,7 +20,7 @@ STATE_FILE = STATE_DIR / "state.json"
 LOCK_FILE = STATE_DIR / "state.lock"
 SPECIAL_WORKSPACE = "special:rewind"
 DEFAULT_GRACE_PERIOD = 15.0  # seconds
-VERSION = "1.2.2"
+VERSION = "1.2.3"
 
 
 def ensure_state_dir():
@@ -728,17 +728,53 @@ def prepare_window_audio_for_close(target: dict):
 
 def flush_workspace_focus(ws_name: str = None):
     """Ensures Hyprland does not keep a hidden window as the active window,
+    preserves focus within special workspaces (e.g. scratchpads), returns focus
+    to the most recently used window rather than arbitrary list order,
     and ensures special:rewind is closed so it never unexpectedly re-opens."""
+    safe_ws = ws_name if (ws_name and ws_name != SPECIAL_WORKSPACE
+                          and re.fullmatch(r"special:[A-Za-z0-9_-]+", ws_name)) else ""
     return hypr_eval(f'''
 local spec = hl.get_active_special_workspace()
 if spec and spec.name == "{SPECIAL_WORKSPACE}" then
     hl.dispatch(hl.dsp.workspace.toggle_special("rewind"))
 end
 
+local function last_used(list)
+    local pick, best = nil, math.huge
+    for _, w in ipairs(list) do
+        local ok, id = pcall(function() return tonumber(w.focus_history_id) end)
+        if ok and id and id >= 0 and id < best then
+            pick, best = w, id
+        end
+    end
+    return pick or list[1]
+end
+
+local from_ws = "{safe_ws}"
+if from_ws ~= "" then
+    local inside = nil
+    local ok, res = pcall(hl.get_workspace_windows, from_ws)
+    if ok and type(res) == "table" and #res > 0 then
+        inside = res
+    else
+        local ok_ws, ws_obj = pcall(hl.get_workspace, from_ws)
+        if ok_ws and ws_obj then
+            local ok_wins, wins_obj = pcall(hl.get_workspace_windows, ws_obj)
+            if ok_wins and type(wins_obj) == "table" and #wins_obj > 0 then
+                inside = wins_obj
+            end
+        end
+    end
+    if inside and #inside > 0 then
+        hl.dispatch(hl.dsp.focus({{ window = last_used(inside) }}))
+        return
+    end
+end
+
 local curr_ws = hl.get_active_workspace()
 local remaining = hl.get_workspace_windows(curr_ws)
 if remaining and #remaining > 0 then
-    hl.dispatch(hl.dsp.focus({{ window = remaining[1] }}))
+    hl.dispatch(hl.dsp.focus({{ window = last_used(remaining) }}))
 else
     local curr_name = curr_ws.name
     local other = (curr_name == "1") and "2" or "1"

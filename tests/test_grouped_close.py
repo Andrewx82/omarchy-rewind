@@ -424,6 +424,39 @@ class DispatcherTests(unittest.TestCase):
                 with patch.object(rewind.subprocess, "run", return_value=result):
                     self.assertEqual(rewind.hypr_dispatch("hl.dsp.window.move({ out_of_group = true })"), expected)
 
+    def test_flush_workspace_focus_special_workspace_and_mru(self):
+        eval_calls = []
+
+        def fake_eval(code):
+            eval_calls.append(code)
+            return True
+
+        with patch.object(rewind, "hypr_eval", side_effect=fake_eval):
+            # Special workspace scratchpad
+            rewind.flush_workspace_focus("special:scratchpad")
+            self.assertEqual(len(eval_calls), 1)
+            code = eval_calls[0]
+            self.assertIn('local from_ws = "special:scratchpad"', code)
+            self.assertIn("local function last_used(list)", code)
+            self.assertIn("w.focus_history_id", code)
+            self.assertIn("last_used(inside)", code)
+            self.assertIn("last_used(remaining)", code)
+
+            # Normal workspace "1" -> sanitized to empty from_ws
+            eval_calls.clear()
+            rewind.flush_workspace_focus("1")
+            self.assertIn('local from_ws = ""', eval_calls[0])
+
+            # special:rewind -> sanitized to empty from_ws
+            eval_calls.clear()
+            rewind.flush_workspace_focus("special:rewind")
+            self.assertIn('local from_ws = ""', eval_calls[0])
+
+            # Invalid / dangerous workspace name -> sanitized to empty from_ws
+            eval_calls.clear()
+            rewind.flush_workspace_focus('special:foo"; os.execute("evil")')
+            self.assertIn('local from_ws = ""', eval_calls[0])
+
 
 class TerminationTests(unittest.TestCase):
     def setUp(self):
