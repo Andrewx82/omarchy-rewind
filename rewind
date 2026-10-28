@@ -20,7 +20,7 @@ STATE_FILE = STATE_DIR / "state.json"
 LOCK_FILE = STATE_DIR / "state.lock"
 SPECIAL_WORKSPACE = "special:rewind"
 DEFAULT_GRACE_PERIOD = 15.0  # seconds
-VERSION = "1.2.3"
+VERSION = "1.2.4"
 
 
 def ensure_state_dir():
@@ -203,6 +203,72 @@ def get_process_tree(root_pid: int) -> set:
     return descendants
 
 
+def get_process_ancestors(pid: int) -> set:
+    """Returns the set of ancestor PIDs for a given PID."""
+    ancestors = set()
+    curr = pid
+    while curr > 1:
+        ancestors.add(curr)
+        try:
+            with open(f"/proc/{curr}/stat", "r") as f:
+                content = f.read()
+                ppid = int(content.split(")")[-1].split()[1])
+                if ppid == curr or ppid <= 0:
+                    break
+                curr = ppid
+        except Exception:
+            break
+    return ancestors
+
+
+def are_pids_related(pid1: int, pid2: int) -> bool:
+    """Checks if two PIDs are in the same process hierarchy (direct ancestor or descendant)."""
+    if pid1 == pid2:
+        return True
+    if pid1 <= 1 or pid2 <= 1:
+        return False
+    try:
+        a1 = get_process_ancestors(pid1)
+        a2 = get_process_ancestors(pid2)
+        return pid1 in a2 or pid2 in a1
+    except Exception:
+        return False
+
+
+def pid_shared_by_other_window(addr: str, pid: int, exclude_special: bool = False, clients: list = None) -> bool:
+    """Checks if another window in the compositor shares the same PID or process hierarchy.
+    If exclude_special is True, windows on special:rewind are ignored.
+    If addr is provided, checks if any window other than addr matches.
+    If addr is None, checks if 2 or more matching windows exist."""
+    if not pid or not isinstance(pid, int) or pid <= 1:
+        return False
+    if clients is None:
+        clients = get_all_clients()
+
+    matching = 0
+    for c in clients:
+        c_addr = c.get("address")
+        if addr and c_addr == addr:
+            continue
+        c_pid = c.get("pid")
+        if not c_pid or not isinstance(c_pid, int) or c_pid <= 1:
+            continue
+        if c_pid != pid and not are_pids_related(c_pid, pid):
+            continue
+        if exclude_special:
+            ws = c.get("workspace", {})
+            ws_name = ws.get("name") if isinstance(ws, dict) else str(ws)
+            if ws_name == SPECIAL_WORKSPACE:
+                continue
+        if addr:
+            return True
+        matching += 1
+        if matching >= 2:
+            return True
+
+    return False
+
+
 def terminate_window(addr: str, pid: int = None):
     """
     Permanently and reliably terminates a window and its process tree:
@@ -251,7 +317,7 @@ def terminate_window(addr: str, pid: int = None):
     if pid and isinstance(pid, int) and pid > 1 and pid != os.getpid() and pid != os.getppid():
         # Safety check: do not kill if another open window shares this PID
         remaining = get_all_clients()
-        shares_pid = any(c.get("address") != addr and c.get("pid") == pid for c in remaining)
+        shares_pid = pid_shared_by_other_window(addr, pid, exclude_special=False, clients=remaining)
         if not shares_pid:
             comm = get_process_comm(pid).lower()
             if comm not in PROTECTED_COMM:
@@ -382,38 +448,6 @@ def notify_shell_widget():
         pass
 
 
-def get_process_ancestors(pid: int) -> set:
-    """Returns the set of ancestor PIDs for a given PID."""
-    ancestors = set()
-    curr = pid
-    while curr > 1:
-        ancestors.add(curr)
-        try:
-            with open(f"/proc/{curr}/stat", "r") as f:
-                content = f.read()
-                ppid = int(content.split(")")[-1].split()[1])
-                if ppid == curr or ppid <= 0:
-                    break
-                curr = ppid
-        except Exception:
-            break
-    return ancestors
-
-
-def are_pids_related(pid1: int, pid2: int) -> bool:
-    """Checks if two PIDs are in the same process hierarchy (direct ancestor or descendant)."""
-    if pid1 == pid2:
-        return True
-    if pid1 <= 1 or pid2 <= 1:
-        return False
-    try:
-        a1 = get_process_ancestors(pid1)
-        a2 = get_process_ancestors(pid2)
-        return pid1 in a2 or pid2 in a1
-    except Exception:
-        return False
-
-
 def get_mpris_players() -> list:
     """Discovers active MPRIS D-Bus player services on the session bus."""
     try:
@@ -472,6 +506,10 @@ def pause_window_media(window_data: dict):
         return None
 
     win_pid = window_data.get("pid", -1)
+    addr = window_data.get("address")
+    if pid_shared_by_other_window(addr, win_pid, exclude_special=True):
+        return None
+
     win_class = (window_data.get("class") or "").lower()
 
     players = get_mpris_players()
@@ -610,6 +648,9 @@ def mute_window_audio(window_data: dict) -> dict:
     if not window_data:
         return None
     win_pid = window_data.get("pid", -1)
+    addr = window_data.get("address")
+    if pid_shared_by_other_window(addr, win_pid, exclude_special=True):
+        return None
     win_class = (window_data.get("class") or "").lower()
     target_pids = ({win_pid} | get_process_tree(win_pid)) if win_pid and win_pid > 0 else set()
 
@@ -661,6 +702,16 @@ def prepare_window_audio_for_close(target: dict):
         return
 
     win_pid = target.get("pid", -1)
+    addr = target.get("address")
+    if (win_pid is None or win_pid <= 0) and addr:
+        for c in get_all_clients():
+            if c.get("address") == addr and c.get("pid"):
+                win_pid = c.get("pid")
+                break
+
+    if pid_shared_by_other_window(addr, win_pid, exclude_special=False):
+        return
+
     win_class = (target.get("class") or "").lower()
     if not win_class and win_pid and isinstance(win_pid, int) and win_pid > 0:
         win_class = get_process_comm(win_pid).lower()

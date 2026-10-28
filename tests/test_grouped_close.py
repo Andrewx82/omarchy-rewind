@@ -933,6 +933,83 @@ class AudioMuteTests(unittest.TestCase):
             self.assertEqual(called_target["address"], "0x3")
             self.assertEqual(called_target["muted_audio"], {"nodes": [75], "pactl": [12]})
 
+    def test_pid_shared_by_other_window(self):
+        clients = [
+            {"address": "0x1", "pid": 5000, "workspace": {"id": 1, "name": "1"}},
+            {"address": "0x2", "pid": 5000, "workspace": {"id": -98, "name": "special:rewind"}},
+            {"address": "0x3", "pid": 6000, "workspace": {"id": 2, "name": "2"}},
+        ]
+
+        # 0x2 sharing PID 5000 with 0x1 (which is on workspace 1)
+        self.assertTrue(rewind.pid_shared_by_other_window("0x2", 5000, exclude_special=False, clients=clients))
+        self.assertTrue(rewind.pid_shared_by_other_window("0x2", 5000, exclude_special=True, clients=clients))
+
+        # 0x1 sharing PID 5000 with 0x2 (which is on special:rewind)
+        self.assertTrue(rewind.pid_shared_by_other_window("0x1", 5000, exclude_special=False, clients=clients))
+        # When excluding special, 0x2 is in special:rewind, so 0x1 has no other open windows
+        self.assertFalse(rewind.pid_shared_by_other_window("0x1", 5000, exclude_special=True, clients=clients))
+
+        # 0x3 has unique PID 6000
+        self.assertFalse(rewind.pid_shared_by_other_window("0x3", 6000, exclude_special=False, clients=clients))
+        self.assertFalse(rewind.pid_shared_by_other_window("0x3", 6000, exclude_special=True, clients=clients))
+
+        # Invalid or root PIDs
+        self.assertFalse(rewind.pid_shared_by_other_window("0x1", 0, clients=clients))
+        self.assertFalse(rewind.pid_shared_by_other_window("0x1", 1, clients=clients))
+        self.assertFalse(rewind.pid_shared_by_other_window("0x1", None, clients=clients))
+
+        # addr=None counting behavior
+        self.assertTrue(rewind.pid_shared_by_other_window(None, 5000, exclude_special=False, clients=clients))
+        self.assertFalse(rewind.pid_shared_by_other_window(None, 6000, exclude_special=False, clients=clients))
+
+        # Process hierarchy matching via are_pids_related
+        with patch.object(rewind, "are_pids_related", side_effect=lambda p1, p2: {p1, p2} == {7000, 7001}):
+            rel_clients = [
+                {"address": "0xa", "pid": 7000, "workspace": {"name": "1"}},
+                {"address": "0xb", "pid": 7001, "workspace": {"name": "1"}},
+            ]
+            self.assertTrue(rewind.pid_shared_by_other_window("0xa", 7000, clients=rel_clients))
+            self.assertTrue(rewind.pid_shared_by_other_window("0xb", 7001, clients=rel_clients))
+
+    def test_mute_window_audio_shared_pid_skipped(self):
+        clients = [
+            {"address": "0x1", "pid": 5000, "workspace": {"name": "1"}},
+            {"address": "0x2", "pid": 5000, "workspace": {"name": "special:rewind"}},
+        ]
+        with patch.object(rewind, "get_all_clients", return_value=clients), \
+             patch.object(rewind, "get_window_audio_streams") as mock_streams, \
+             patch("subprocess.run") as mock_run:
+            # Closing 0x2 while 0x1 is open on workspace 1: audio mute must be skipped!
+            res = rewind.mute_window_audio({"address": "0x2", "pid": 5000, "class": "chromium"})
+            self.assertIsNone(res)
+            mock_streams.assert_not_called()
+            mock_run.assert_not_called()
+
+    def test_prepare_window_audio_for_close_shared_pid_skipped(self):
+        clients = [
+            {"address": "0x1", "pid": 5000, "workspace": {"name": "1"}},
+            {"address": "0x2", "pid": 5000, "workspace": {"name": "special:rewind"}},
+        ]
+        with patch.object(rewind, "get_all_clients", return_value=clients), \
+             patch.object(rewind, "get_window_audio_streams") as mock_streams, \
+             patch("subprocess.run") as mock_run:
+            # Terminating 0x2 while 0x1 is still alive: link destruction must be skipped!
+            rewind.prepare_window_audio_for_close({"address": "0x2", "pid": 5000, "class": "chromium"})
+            mock_streams.assert_not_called()
+            mock_run.assert_not_called()
+
+    def test_pause_window_media_shared_pid_skipped(self):
+        clients = [
+            {"address": "0x1", "pid": 5000, "workspace": {"name": "1"}},
+            {"address": "0x2", "pid": 5000, "workspace": {"name": "special:rewind"}},
+        ]
+        with patch.object(rewind, "get_all_clients", return_value=clients), \
+             patch.object(rewind, "get_mpris_players", return_value=["org.mpris.MediaPlayer2.chromium.instance5000"]) as mock_mpris:
+            # Closing 0x2 while 0x1 is open on workspace 1: MPRIS pause must be skipped!
+            res = rewind.pause_window_media({"address": "0x2", "pid": 5000, "class": "chromium"})
+            self.assertIsNone(res)
+            mock_mpris.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
